@@ -1,0 +1,19 @@
+* RC + shunt + RL — first-enable transient (ngspice)
+* Edit L1 if you know coil inductance. Run: ngspice rc_coil_equiv.ngspice.cir
+*
+.param Rser=20 Cbig=100u Csmall=100n Rsh=0.1 Rload=51 L1=5m
+Vsupply 1 0 DC 12
+Rser 1 2 {Rser}
+* Ideal switch: pulse 0->12 for first 2 ms then 5 kHz PWM (example)
+Vsw 2 0 PULSE(0 12 0 1n 1n 2m 1e9)
+C1 2 0 {Cbig}
+C2 2 0 {Csmall}
+Rsh 2 3 {Rsh}
+L1 3 4 {L1}
+Rload 4 0 {Rload}
+.tran 1u 5m
+.control
+run
+print i(Vsw) i(Rsh)
+.endc
+.end
