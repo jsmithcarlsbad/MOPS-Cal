@@ -7,13 +7,13 @@ Loads CalibratorUI.ui from this directory. Settings in CalibratorUI.ini (ASCII).
 Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
   TM:: key=value ... — telemetry: LEDs (alarm, cfg, closed_loop, ramp, settle, meas_ok); measured LCDs (meas_ok,
-    X_ma/Y_ma/Z_ma, set_*_ma, lim_*_ma); coil bus volts (coil_V_X/Y/Z).
+    X_ma/Y_ma/Z_ma, set_*_ma); coil bus volts (coil_V_X/Y/Z).
   On connect: host sends version + hw_report (Pico replies OK VERSION … and full TXT:: I2C/INA/H-bridge summary).
   While connected: host sends alive ~1 Hz; Pico replies TXT:: OK ALIVE (not logged). Stale >3 s → yellow LED + status hint.
   On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready; legacy abort still on Pico).
   Status bar Reset sends safe_reset (clear SAFE); SAFE button sends safe.
   Settings (menu, saved in CalibratorUI.ini [settings]): PWM 3/5 kHz, max mA (20–100 + design max).
-    Each axis Set sends: set_<axis>_ma, set_<axis>_pwm_hz, <axis>_alarm_limit.
+    Each axis Set sends: set_<axis>_ma, set_<axis>_pwm_hz.
 
 Run:
     pip install -r requirements.txt
@@ -201,7 +201,7 @@ def _init_measured_ma_lcd(lcd: QLCDNumber) -> None:
 
 def _meas_lcd_digit_color(meas: float, target: float, limit: float) -> str:
     """
-    Red: over-range (measured above channel max / alarm limit).
+    Red: over-range (measured above Settings → Max Current mA).
     Green: within ±5% of target mA.
     Amber: within top 10% of channel limit (high current, not necessarily on target).
     Else: neutral light gray.
@@ -682,7 +682,7 @@ class CalibratorController:
             if tgt is None:
                 tgt = float(sp.value())
             if lim is None:
-                lim = float(sp.maximum())
+                lim = float(self._settings_max_ma)
             if m is None:
                 lcd.display("---")
                 lcd.setStyleSheet(
@@ -771,11 +771,9 @@ class CalibratorController:
         val = float(spin.value())
         axl = axis.lower()
         hz = self._settings_pwm_hz
-        max_ma = self._settings_max_ma
         lines = [
             f"set_{axl}_ma {val:.2f}\r\n",
             f"set_{axl}_pwm_hz {hz}\r\n",
-            f"{axl}_alarm_limit {max_ma:.2f}\r\n",
         ]
         try:
             # Pico latches SAFE on `safe`; set_*_ma / set_*_pwm_hz are refused until safe_reset.
@@ -784,7 +782,7 @@ class CalibratorController:
                 self._serial.write(line.encode("ascii", errors="replace"))
             self._serial.flush()
             self._set_status(
-                f"Set {axis}: {val:.2f} mA, PWM {hz} Hz, limit {max_ma:.0f} mA"
+                f"Set {axis}: {val:.2f} mA, PWM {hz} Hz"
             )
         except Exception as e:
             self._set_status(f"Serial write failed: {e}")

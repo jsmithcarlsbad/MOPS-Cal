@@ -26,20 +26,28 @@ LCD_I2C_FREQ_HZ = 400_000
 LCD_I2C_ADDR = 0x27
 # Power-up / I2C retries if the panel shows a full row of blocks (uninitialized HD44780).
 LCD_INIT_RETRIES = 4
-# --- OSOYOO Model Y — GPIO (Pico) wiring; edit to match your harness ---
-# Two PT5126 bridge ICs on the board — no I2C to Pico; firmware only sets PWM + DIR below.
-H_BRIDGE_MODEL = "OSOYOO Model Y"
-PT5126_COUNT = 2
-# Per axis: one PWM on EN (speed) + two direction pins (forward fixed per COIL_DRIVER.md).
-# Example mapping (OSOYOO “forward”): IN1=1 IN2=0, IN3=1 IN4=0, etc.
-# High-side / unipolar drive: one bridge output per axis → one wire to RC/coil (return to GND).
-# Board silkscreen shows two posts per output (e.g. AK1 and AK2) tied to the SAME net — use ONE terminal per axis.
-# X = A ENA → AK1 or AK2 (either). Y = A ENB → AK3 or AK4. Z = B ENA → BK1 or BK2.
-PWM_EN_PINS = (10, 12, 14)  # A_ENA, A_ENB, B_ENA
-# Direction pins: (IN1, IN2), (IN3, IN4), (B_IN1, B_IN2) — two pins per axis
-DIR_PINS_X = (6, 7)   # A IN1, A IN2
-DIR_PINS_Y = (8, 9)   # A IN3, A IN4
-DIR_PINS_Z = (11, 13)  # B IN1, B IN2
+# --- Coil power drivers (Pico GPIO) ---
+# "drv8871_3ch" = three TI DRV8871 H-bridge modules (IN1/IN2 logic; VM 6.5–45 V). See TI SLVSCY9B.
+# "mosfet_3ch" = three low-side MOSFET modules; one PWM each; no DIR.
+# "model_y" = legacy OSOYOO Model Y (2× PT5126): PWM on EN + DIR pin pairs below.
+COIL_DRIVER_HW = "drv8871_3ch"
+
+# Host log / hw_report title (set appropriately for COIL_DRIVER_HW).
+H_BRIDGE_MODEL = "3× TI DRV8871"
+PT5126_COUNT = 0  # unused for drv8871_3ch / mosfet_3ch; legacy Model Y used 2
+
+# drv8871_3ch: IN1 gets hardware PWM; IN2 held low (unidirectional coil + coast between PWM pulses).
+# Match your breakout labels to TI IN1/IN2. PWM period should keep both inputs low < ~1 ms (sleep).
+DRV8871_IN1_PWM_PINS = (10, 12, 14)  # X, Y, Z → module IN1
+DRV8871_IN2_PINS = (11, 13, 15)  # X, Y, Z → module IN2 (held 0)
+
+# mosfet_3ch / model_y PWM pins (ignored when COIL_DRIVER_HW == "drv8871_3ch"):
+PWM_EN_PINS = (10, 12, 14)
+
+# Legacy Model Y only — ignored when COIL_DRIVER_HW == "mosfet_3ch" (pins not driven).
+DIR_PINS_X = (6, 7)
+DIR_PINS_Y = (8, 9)
+DIR_PINS_Z = (11, 13)
 
 # Engineer RC target: **~83 Hz** cutoff (e.g. 20 Ω + 100 µF → fc ≈ 80 Hz). Use **5 kHz** PWM so ripple is
 # well above fc → quasi-DC average at the coil for INA3221 / control (not audio-frequency PWM).
@@ -55,12 +63,15 @@ CONTROL_FEEDFORWARD = 1
 # After PI, cap duty to at most (target/limit)*(1+PI_DUTY_HEADROOM) to prevent runaway toward 100% PWM.
 # Set -1 to disable the cap (not recommended).
 PI_DUTY_HEADROOM = 0.35
+# 1 = trip SAFE when |shunt I| exceeds MAX_CURRENT_PER_COIL_MA (no per-axis host limits).
+# 0 = never trip on overcurrent (bring-up if INA reads spurious mA until shunt wiring is verified).
+OVERCURRENT_TRIP_ENABLE = 0
 # Ignore overcurrent→SAFE until this many ms after boot (INA/converters settle; avoids false SAFE).
 OVERCURRENT_ARM_MS = 800
 # Require this many consecutive control cycles (50 Hz → 20 ms each) over limit before SAFE.
 # 3 ≈ 60 ms sustained overcurrent; reduces trips from single-sample INA spikes.
 OVERCURRENT_CONFIRM_SAMPLES = 3
-# If last cycle's PWM duty < OC_LOW_DUTY_U_THRESH, do not trip on I just above alarm_limit
+# If last cycle's PWM duty < OC_LOW_DUTY_U_THRESH, do not trip on I just above MAX_CURRENT_PER_COIL_MA
 # (INA can read high vs low EN duty on some bridges). Trip only if I > limit*(1+OC_LOW_DUTY_LIMIT_RELAX).
 # Set OC_LOW_DUTY_IGNORE=0 for strict limit-only behavior.
 OC_LOW_DUTY_IGNORE = 1

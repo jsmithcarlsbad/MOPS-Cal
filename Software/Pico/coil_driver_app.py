@@ -1,4 +1,4 @@
-# coil_driver_app.py — Helmholtz coil driver (Model Y + INA3221 + RC + Pico W)
+# coil_driver_app.py — Helmholtz coil driver (MOSFET 3ch or Model Y + INA3221 + RC + Pico W)
 # See COIL_DRIVER.md. Deploy as main.py on device or copy main.py + this package to Pico.
 
 import sys
@@ -10,8 +10,8 @@ import config
 
 # Firmware version (single source of truth). Bump MAJOR for large / incompatible changes;
 # bump MINOR for bug fixes and small additions.
-VERSION_MAJOR = 1
-VERSION_MINOR = 38
+VERSION_MAJOR = 3
+VERSION_MINOR = 4
 VERSION = "%d.%d" % (VERSION_MAJOR, VERSION_MINOR)
 
 
@@ -24,6 +24,8 @@ def host_print(*args):
 i2c = None
 mon = None
 pwms = []
+# DRV8871: IN2 GPIO per axis (IN1 uses hardware PWM in pwms); unused for other COIL_DRIVER_HW.
+_drv8871_in2_pins = [None, None, None]
 lcd = None
 # PCF8574 address actually opened (for host boot log); None if LCD missing.
 lcd_i2c_addr_used = None
@@ -36,10 +38,11 @@ def _axis_order():
 
 
 def _init_hardware():
-    global i2c, mon, pwms
+    global i2c, mon, pwms, _drv8871_in2_pins
     i2c = None
     mon = None
     pwms = []
+    _drv8871_in2_pins = [None, None, None]
     try:
         i2c = I2C(
             int(getattr(config, "I2C_ID", 0)),
@@ -63,27 +66,49 @@ def _init_hardware():
         i2c = None
         mon = None
 
-    # Model Y: fixed "forward" direction per OSOYOO tables
-    for pair in (
-        getattr(config, "DIR_PINS_X", (6, 7)),
-        getattr(config, "DIR_PINS_Y", (8, 9)),
-        getattr(config, "DIR_PINS_Z", (11, 13)),
-    ):
-        try:
-            Pin(pair[0], Pin.OUT).value(1)
-            Pin(pair[1], Pin.OUT).value(0)
-        except Exception:
-            pass
+    hw = str(getattr(config, "COIL_DRIVER_HW", "model_y"))
+    if hw == "model_y":
+        # Model Y: fixed "forward" direction per OSOYOO tables
+        for pair in (
+            getattr(config, "DIR_PINS_X", (6, 7)),
+            getattr(config, "DIR_PINS_Y", (8, 9)),
+            getattr(config, "DIR_PINS_Z", (11, 13)),
+        ):
+            try:
+                Pin(pair[0], Pin.OUT).value(1)
+                Pin(pair[1], Pin.OUT).value(0)
+            except Exception:
+                pass
 
     pwm_hz = int(getattr(config, "PWM_FREQ_HZ", 20_000))
-    for pin_num in getattr(config, "PWM_EN_PINS", (10, 12, 14)):
-        try:
-            p = PWM(Pin(pin_num))
-            p.freq(pwm_hz)
-            p.duty_u16(0)
-            pwms.append(p)
-        except Exception:
-            pwms.append(None)
+    if hw == "drv8871_3ch":
+        in1 = getattr(config, "DRV8871_IN1_PWM_PINS", (10, 12, 14))
+        in2 = getattr(config, "DRV8871_IN2_PINS", (11, 13, 15))
+        for i in range(3):
+            try:
+                g2 = int(in2[i])
+                p2 = Pin(g2, Pin.OUT)
+                p2.value(0)
+                _drv8871_in2_pins[i] = p2
+            except Exception:
+                pass
+        for pin_num in in1:
+            try:
+                p = PWM(Pin(int(pin_num)))
+                p.freq(pwm_hz)
+                p.duty_u16(0)
+                pwms.append(p)
+            except Exception:
+                pwms.append(None)
+    else:
+        for pin_num in getattr(config, "PWM_EN_PINS", (10, 12, 14)):
+            try:
+                p = PWM(Pin(pin_num))
+                p.freq(pwm_hz)
+                p.duty_u16(0)
+                pwms.append(p)
+            except Exception:
+                pwms.append(None)
     while len(pwms) < 3:
         pwms.append(None)
 
@@ -171,9 +196,6 @@ MAX_MA_DEFAULT = float(getattr(config, "MAX_CURRENT_PER_COIL_MA", 500.0))
 set_X_ma = 0.0
 set_Y_ma = 0.0
 set_Z_ma = 0.0
-alarm_limit_X_ma = MAX_MA_DEFAULT
-alarm_limit_Y_ma = MAX_MA_DEFAULT
-alarm_limit_Z_ma = MAX_MA_DEFAULT
 
 manual_pwm_duty = [None, None, None]
 # Last commanded duty 0..1 per axis (overcurrent soft-gate, telemetry).
@@ -277,12 +299,11 @@ def _lcd_line2_ma():
             x_m, y_m, z_m = read_currents_ma_ordered_xyz()
         except Exception:
             measured_ok = False
-    lims = (alarm_limit_X_ma, alarm_limit_Y_ma, alarm_limit_Z_ma)
     tgt = (max(0.0, set_X_ma), max(0.0, set_Y_ma), max(0.0, set_Z_ma))
     a = (x_m, y_m, z_m)
     parts = []
     for i in range(3):
-        parts.append(_lcd_seg_ma(a[i], lims[i], tgt[i], measured_ok))
+        parts.append(_lcd_seg_ma(a[i], MAX_MA_DEFAULT, tgt[i], measured_ok))
     return "".join(parts)[:16]
 
 
@@ -417,6 +438,12 @@ def set_pwm(axis, duty):
     duty = max(0.0, min(1.0, duty))
     if 0 <= axis < len(_last_u_cmd):
         _last_u_cmd[axis] = duty
+    if str(getattr(config, "COIL_DRIVER_HW", "")) == "drv8871_3ch":
+        if axis < len(_drv8871_in2_pins) and _drv8871_in2_pins[axis] is not None:
+            try:
+                _drv8871_in2_pins[axis].value(0)
+            except Exception:
+                pass
     pwms[axis].duty_u16(int(duty * 65535))
 
 
@@ -439,7 +466,8 @@ def control_step(_=None):
     c0, c1, c2 = _read_currents_raw_ch012()
     currents_ch = [c0, c1, c2]
     order = _axis_order()
-    limits = (alarm_limit_X_ma, alarm_limit_Y_ma, alarm_limit_Z_ma)
+    lim_one = max(1e-6, MAX_MA_DEFAULT)
+    limits = (lim_one, lim_one, lim_one)
     axes = ("X", "Y", "Z")
 
     # Overcurrent — trip SAFE before any PWM update this cycle (not in first OVERCURRENT_ARM_MS after boot).
@@ -449,7 +477,8 @@ def control_step(_=None):
         and time.ticks_diff(time.ticks_ms(), _BOOT_TICKS_MS) >= arm_ms
     )
     oc_need = max(1, int(getattr(config, "OVERCURRENT_CONFIRM_SAMPLES", 3)))
-    if not _safe_state and oc_ready:
+    oc_trip = int(getattr(config, "OVERCURRENT_TRIP_ENABLE", 1))
+    if oc_trip and not _safe_state and oc_ready:
         for j in range(3):
             ch_idx = order[j]
             # Magnitude — a mistaken SW sign flip could make I negative and skip a plain > limit check.
@@ -637,9 +666,6 @@ def control_step(_=None):
                 "set_X_ma=%.2f" % max(0.0, set_X_ma),
                 "set_Y_ma=%.2f" % max(0.0, set_Y_ma),
                 "set_Z_ma=%.2f" % max(0.0, set_Z_ma),
-                "lim_X_ma=%.2f" % alarm_limit_X_ma,
-                "lim_Y_ma=%.2f" % alarm_limit_Y_ma,
-                "lim_Z_ma=%.2f" % alarm_limit_Z_ma,
                 "closed_loop=%d" % closed_loop,
                 "ramp=%d" % (1 if any(_ramp_active) else 0),
                 "settle=%d" % (1 if any(_settle_active) else 0),
@@ -682,7 +708,6 @@ def _parse_float(s, default=None):
 
 def handle_line(line):
     global set_X_ma, set_Y_ma, set_Z_ma
-    global alarm_limit_X_ma, alarm_limit_Y_ma, alarm_limit_Z_ma
     global _last_host_rx_ms, _host_set_ma_ack
     global _safe_state, _alarm_latched
 
@@ -802,19 +827,6 @@ def handle_line(line):
         hz = int(max(100, min(100_000, v)))
         return ("OK set_z_pwm_hz %d" % hz) if _set_pwm_hz_axis(2, hz) else "ERR set_z_pwm_hz"
 
-    if key == "x_alarm_limit":
-        v = _parse_float(rest, MAX_MA_DEFAULT)
-        alarm_limit_X_ma = v
-        return "OK X_alarm_limit"
-    if key == "y_alarm_limit":
-        v = _parse_float(rest, MAX_MA_DEFAULT)
-        alarm_limit_Y_ma = v
-        return "OK Y_alarm_limit"
-    if key == "z_alarm_limit":
-        v = _parse_float(rest, MAX_MA_DEFAULT)
-        alarm_limit_Z_ma = v
-        return "OK Z_alarm_limit"
-
     return "ERR unknown"
 
 
@@ -843,21 +855,26 @@ def _report_hardware_to_host(boot_footer=True):
         "Control: loop %d Hz; telemetry every %d ms (~%.1f Hz)"
         % (LOOP_HZ, TELEM_PERIOD_MS, thz)
     )
-    host_print(
-        "Overcurrent→SAFE armed after %d ms from boot (config OVERCURRENT_ARM_MS)"
-        % int(getattr(config, "OVERCURRENT_ARM_MS", 800))
-    )
-    host_print(
-        "Overcurrent→SAFE needs %d consecutive samples over limit (OVERCURRENT_CONFIRM_SAMPLES)"
-        % max(1, int(getattr(config, "OVERCURRENT_CONFIRM_SAMPLES", 3)))
-    )
-    if int(getattr(config, "OC_LOW_DUTY_IGNORE", 1)):
+    if int(getattr(config, "OVERCURRENT_TRIP_ENABLE", 1)):
         host_print(
-            "Overcurrent: low EN duty soft band — u<%.2f → trip only if I>limit×(1+%.2f) (OC_LOW_DUTY_*)"
-            % (
-                float(getattr(config, "OC_LOW_DUTY_U_THRESH", 0.35)),
-                float(getattr(config, "OC_LOW_DUTY_LIMIT_RELAX", 1.0)),
+            "Overcurrent→SAFE armed after %d ms from boot (config OVERCURRENT_ARM_MS)"
+            % int(getattr(config, "OVERCURRENT_ARM_MS", 800))
+        )
+        host_print(
+            "Overcurrent→SAFE needs %d consecutive samples over limit (OVERCURRENT_CONFIRM_SAMPLES)"
+            % max(1, int(getattr(config, "OVERCURRENT_CONFIRM_SAMPLES", 3)))
+        )
+        if int(getattr(config, "OC_LOW_DUTY_IGNORE", 1)):
+            host_print(
+                "Overcurrent: low EN duty soft band — u<%.2f → trip only if I>limit×(1+%.2f) (OC_LOW_DUTY_*)"
+                % (
+                    float(getattr(config, "OC_LOW_DUTY_U_THRESH", 0.35)),
+                    float(getattr(config, "OC_LOW_DUTY_LIMIT_RELAX", 1.0)),
+                )
             )
+    else:
+        host_print(
+            "Overcurrent→SAFE: disabled (config OVERCURRENT_TRIP_ENABLE=0; shunt I does not latch SAFE)"
         )
     if int(getattr(config, "RAMP_SETTLE_DC_ENABLE", 1)):
         host_print(
@@ -941,27 +958,59 @@ def _report_hardware_to_host(boot_footer=True):
         host_print("  LCD: not opened — check retries / wiring (see STATUS LCD … during init)")
 
     hb = str(getattr(config, "H_BRIDGE_MODEL", "H-bridge"))
-    n_pt = int(getattr(config, "PT5126_COUNT", 2))
+    n_pt = int(getattr(config, "PT5126_COUNT", 0))
     pwm_hz = int(getattr(config, "PWM_FREQ_HZ", 20_000))
     p_en = getattr(config, "PWM_EN_PINS", (10, 12, 14))
     dx = getattr(config, "DIR_PINS_X", (6, 7))
     dy = getattr(config, "DIR_PINS_Y", (8, 9))
     dz = getattr(config, "DIR_PINS_Z", (11, 13))
-    host_print("--- H-bridge (%s, %d x PT5126) ---" % (hb, n_pt))
-    host_print(
-        "  PT5126: no I2C — Pico only sets PWM duty on EN pins and fixed DIR per axis."
-    )
-    host_print(
-        "  Channel use: X = bank A ENA, Y = bank A ENB, Z = bank B ENA (spare = bank B ENB)"
-    )
-    host_print(
-        "  PWM %d Hz — X=GP%u Y=GP%u Z=GP%u"
-        % (pwm_hz, p_en[0], p_en[1], p_en[2])
-    )
-    host_print(
-        "  DIR — X: GP%u,GP%u | Y: GP%u,GP%u | Z: GP%u,GP%u (forward pattern in firmware)"
-        % (dx[0], dx[1], dy[0], dy[1], dz[0], dz[1])
-    )
+    hw = str(getattr(config, "COIL_DRIVER_HW", "model_y"))
+    if hw == "drv8871_3ch":
+        in1 = getattr(config, "DRV8871_IN1_PWM_PINS", (10, 12, 14))
+        in2 = getattr(config, "DRV8871_IN2_PINS", (11, 13, 15))
+        host_print("--- Coil drivers (%s) ---" % hb)
+        host_print(
+            "  3× TI DRV8871 — IN1 = PWM from Pico; IN2 held low (TI unidirectional PWM / coast decay)."
+        )
+        host_print(
+            "  VM 6.5–45 V per datasheet; OUT1/OUT2 to coil. Use f_PWM so off-time < ~1 ms (sleep if both IN low)."
+        )
+        host_print(
+            "  IN1 PWM %d Hz — X=GP%u Y=GP%u Z=GP%u"
+            % (pwm_hz, in1[0], in1[1], in1[2])
+        )
+        host_print(
+            "  IN2 low (GPIO) — X=GP%u Y=GP%u Z=GP%u"
+            % (in2[0], in2[1], in2[2])
+        )
+    elif hw == "mosfet_3ch":
+        host_print("--- Coil drivers (%s) ---" % hb)
+        host_print(
+            "  3× MOSFET modules — one PWM per axis to module input; no bridge DIR pins."
+        )
+        host_print(
+            "  Power wiring: VIN+ VIN− VOUT+ VOUT− (see module silk); coils on VOUT side."
+        )
+        host_print(
+            "  PWM %d Hz — X=GP%u Y=GP%u Z=GP%u"
+            % (pwm_hz, p_en[0], p_en[1], p_en[2])
+        )
+    else:
+        host_print("--- H-bridge (%s, %d x PT5126) ---" % (hb, n_pt))
+        host_print(
+            "  PT5126: no I2C — Pico only sets PWM duty on EN pins and fixed DIR per axis."
+        )
+        host_print(
+            "  Channel use: X = bank A ENA, Y = bank A ENB, Z = bank B ENA (spare = bank B ENB)"
+        )
+        host_print(
+            "  PWM %d Hz — X=GP%u Y=GP%u Z=GP%u"
+            % (pwm_hz, p_en[0], p_en[1], p_en[2])
+        )
+        host_print(
+            "  DIR — X: GP%u,GP%u | Y: GP%u,GP%u | Z: GP%u,GP%u (forward pattern in firmware)"
+            % (dx[0], dx[1], dy[0], dy[1], dz[0], dz[1])
+        )
     pwm_ok = []
     for i in range(3):
         pwm_ok.append("OK" if i < len(pwms) and pwms[i] is not None else "FAIL")
