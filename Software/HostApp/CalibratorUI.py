@@ -778,6 +778,8 @@ class CalibratorController:
             f"{axl}_alarm_limit {max_ma:.2f}\r\n",
         ]
         try:
+            # Pico latches SAFE on `safe`; set_*_ma / set_*_pwm_hz are refused until safe_reset.
+            self._serial.write(b"safe_reset\r\n")
             for line in lines:
                 self._serial.write(line.encode("ascii", errors="replace"))
             self._serial.flush()
