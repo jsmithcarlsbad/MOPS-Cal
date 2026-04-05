@@ -8,7 +8,8 @@ Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
   TM:: key=value ... — telemetry: LEDs (alarm, cfg, closed_loop, ramp, settle, meas_ok); measured LCDs (meas_ok,
     X_ma/Y_ma/Z_ma, set_*_ma); coil bus volts (coil_V_X/Y/Z).
-  On connect: host sends version + hw_report (Pico replies OK VERSION … and full TXT:: I2C/INA/H-bridge summary).
+  On connect: host sends Ctrl+C then Ctrl+D (MicroPython: break REPL or stop script, then soft reset so main.py runs),
+    waits for boot while the serial poll timer drains USB, then sends version + hw_report (Pico replies OK VERSION … and TXT:: …).
   While connected: host sends alive ~1 Hz; Pico replies TXT:: OK ALIVE (not logged). Stale >3 s → yellow LED + status hint.
   On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready; legacy abort still on Pico).
   Status bar Reset sends safe_reset (clear SAFE); SAFE button sends safe.
@@ -1017,14 +1018,24 @@ class CalibratorController:
         self._reset_measured_lcds_no_data()
         self._set_connected_ui(True)
         self._set_status(f"Opened {port} @ {baud} baud.")
-        # Brief pause so USB CDC / soft-reset can finish before we poke the device.
-        time.sleep(0.2)
+        # Exit stuck >>> REPL or restart app: Ctrl+C (0x03) then Ctrl+D (0x04) = soft reset → main.py runs again.
         try:
-            # version: OK VERSION for status bar; hw_report: full I2C/INA/H-bridge TXT:: (boot spam is often missed)
+            self._serial.write(b"\x03\x04")
+            self._serial.flush()
+        except Exception:
+            pass
+        self._set_status("Pico soft reset sent; waiting for boot…")
+        # Keep processing Qt events so _poll_serial (50 ms) drains USB during MicroPython restart.
+        t_boot = time.monotonic() + 1.6
+        while time.monotonic() < t_boot:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        try:
             self._serial.write(b"version\r\nhw_report\r\n")
             self._serial.flush()
         except Exception:
             pass
+        self._set_status(f"Opened {port} @ {baud} baud.")
 
     def _send_pico_link_heartbeat(self) -> None:
         """Pico: alive refreshes slave LCD link and returns OK ALIVE for host liveness."""
