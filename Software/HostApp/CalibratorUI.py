@@ -7,23 +7,37 @@ Loads CalibratorUI.ui from this directory. Settings in CalibratorUI.ini (ASCII).
 Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
   TM:: key=value ... — telemetry: LEDs (alarm, cfg, closed_loop, ramp, settle, meas_ok); measured LCDs (meas_ok,
-    X_ma/Y_ma/Z_ma, set_*_ma); coil bus volts (coil_V_X/Y/Z).
-  On connect: host sends Ctrl+C then Ctrl+D (MicroPython: break REPL or stop script, then soft reset so main.py runs),
-    waits for boot while the serial poll timer drains USB, then sends version + hw_report (Pico replies OK VERSION … and TXT:: …).
-  While connected: host sends alive ~1 Hz; Pico replies TXT:: OK ALIVE (not logged). Stale >3 s → yellow LED + status hint.
+    X_ma/Y_ma/Z_ma, set_*_ma); coil bus volts (coil_V_X/Y/Z). Unprefixed TM-shaped rows (USB framing) use the same
+    parser and are not copied to the text log.
+  On connect: by default the host does not reset the Pico — it clears DTR/RTS after opening the COM port (Windows often toggles them and resets RP2040), waits briefly, then sends version + hw_report.
+    Optional Settings → "Soft reset on connect" (CalibratorUI.ini [serial] soft_reset_on_connect=1): Ctrl+C then Ctrl+D (MicroPython soft reset),
+    then a short boot wait, then version + hw_report — use only when stuck in >>> REPL.
+  While connected: host sends alive ~1 Hz; Pico replies TXT:: OK ALIVE (not logged). Link “fresh” on any TXT::, TM telemetry, or OK ALIVE.
+    Stale >3 s with none of the above → yellow LED + status hint (STALE dbg at DEBUG≥1 is logged once per stale episode).
   On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready; legacy abort still on Pico).
   Status bar Reset sends safe_reset (clear SAFE); SAFE button sends safe.
   Settings (menu, saved in CalibratorUI.ini [settings]): PWM 3/5 kHz, max mA (20–100 + design max).
     Each axis Set sends: set_<axis>_ma, set_<axis>_pwm_hz.
 
-Run:
+  Debug (terminal stdout): CalibratorUI.ini [debug] DEBUG = integer 0–9 (default 0).
+    One line always goes to stderr with ini path and effective level (even when DEBUG=0).
+    0 = off. 1 = basic (connect/disconnect, serial backlog cap, log trim, Pico version).
+    2 = + TXT:: / unprefixed serial lines (truncated). 3 = + raw non-TM lines (repr, capped).
+
+  Run:
     pip install -r requirements.txt
     python CalibratorUI.py
+
+  Host app version: CALIBRATOR_UI_VERSION in this file (bump with user-verified releases; pair with
+  Software/Pico coil_driver_app.py VERSION in git commits).
+  Help → About Calibrator: logo from Software/Host/3DHC_Logo.png (or HostApp fallback), UI and Pico
+  versions, Python libraries, attribution.
 """
 
 from __future__ import annotations
 
 import configparser
+import html
 import re
 import sys
 import time
@@ -32,7 +46,7 @@ from pathlib import Path
 import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QFile, QIODevice, Qt, QTimer
-from PySide6.QtGui import QAction, QTextCursor
+from PySide6.QtGui import QAction, QPixmap, QTextCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -56,11 +70,33 @@ from PySide6.QtWidgets import (
 _HERE = Path(__file__).resolve().parent
 _UI_PATH = _HERE / "CalibratorUI.ui"
 _INI_PATH = _HERE / "CalibratorUI.ini"
+# Project logo for Help → About (user asset); also accepts HostApp/3DHC_Logo.png as fallback.
+_HOST_ASSETS_DIR = _HERE.parent / "Host"
+_ABOUT_LOGO_NAME = "3DHC_Logo.png"
+_ABOUT_CONTACT_EMAIL = "jsmith.carlsbad@gmail.com"
 
 # Match Software/Pico/config.py MAX_CURRENT_PER_COIL_MA (drive / shunt design limit).
 PICO_MAX_COIL_MA = 500.0
 _PWM_FREQ_HZ_CHOICES = (3000, 5000)
 _MAX_CURRENT_MA_CHOICES = (20.0, 50.0, 80.0, 100.0, PICO_MAX_COIL_MA)
+
+# Host UI version (single source of truth for the PySide app). Bump MINOR after each user-verified fix;
+# bump MAJOR only for incompatible protocol/UI changes. Git commit messages should cite this and
+# coil_driver_app.py VERSION as a tested pair.
+CALIBRATOR_UI_VERSION_MAJOR = 1
+CALIBRATOR_UI_VERSION_MINOR = 1
+CALIBRATOR_UI_VERSION = "%d.%d" % (CALIBRATOR_UI_VERSION_MAJOR, CALIBRATOR_UI_VERSION_MINOR)
+
+_HELP_ABOUT_TITLE = "About Calibrator"
+
+
+def _resolve_about_logo_path() -> Path | None:
+    for base in (_HOST_ASSETS_DIR, _HERE):
+        p = base / _ABOUT_LOGO_NAME
+        if p.is_file():
+            return p
+    return None
+
 
 # Pico serial protocol (line-oriented, newline-terminated):
 #   TXT:: <text>  — human-readable log for CalibratorTestOutput (debug, boot, I2C scan, etc.)
@@ -86,6 +122,15 @@ _MEAS_NEAR_MAX_FRAC = 0.10
 _COIL_V_LOW_RED = 11.8
 _COIL_V_GREEN_HI = 12.3
 _COIL_V_AMBER_HI = 12.5
+
+# Avoid freezing the UI thread: bound serial parsing per tick; trim the boot log (TXT:: flood).
+_MAX_SERIAL_LINES_PER_TICK = 40
+_MAX_PICO_LOG_BLOCKS = 2000
+# After Connect: process RX in slices (lines) so the event loop stays responsive during hw_report.
+_CONNECT_RX_PUMP_SLICE_LINES = 10
+_CONNECT_RX_PUMP_MAX_SLICES = 600
+# After opening COM on Windows, DTR/RTS can reset RP2040; clear them, then wait before first commands.
+_CONNECT_SETTLE_NO_SOFT_RESET_S = 0.45
 
 # LED indicator colors (display-only QRadioButton ::indicator)
 _LED_COLORS = {
@@ -174,12 +219,18 @@ def load_ini() -> configparser.ConfigParser:
         cp.set("serial", "port", "")
     if not cp.has_option("serial", "baud"):
         cp.set("serial", "baud", "115200")
+    if not cp.has_option("serial", "soft_reset_on_connect"):
+        cp.set("serial", "soft_reset_on_connect", "0")
     if not cp.has_section("settings"):
         cp.add_section("settings")
     if not cp.has_option("settings", "pwm_freq_hz"):
         cp.set("settings", "pwm_freq_hz", "5000")
     if not cp.has_option("settings", "max_ma_mA"):
         cp.set("settings", "max_ma_mA", "100")
+    if not cp.has_section("debug"):
+        cp.add_section("debug")
+    if not cp.has_option("debug", "DEBUG"):
+        cp.set("debug", "DEBUG", "0")
     return cp
 
 
@@ -269,9 +320,41 @@ def _load_ui() -> QMainWindow | None:
 class CalibratorController:
     """Wires UI widgets, INI, COM list, and pyserial."""
 
+    def _read_debug_level(self) -> int:
+        raw = "0"
+        sec = "debug"
+        if self._ini.has_section(sec):
+            if self._ini.has_option(sec, "DEBUG"):
+                raw = self._ini.get(sec, "DEBUG", fallback="0")
+            else:
+                for opt in self._ini.options(sec):
+                    if opt.lower() == "debug":
+                        raw = self._ini.get(sec, opt, fallback="0")
+                        break
+        try:
+            v = int(str(raw).strip())
+        except ValueError:
+            v = 0
+        return max(0, min(9, v))
+
+    def _dbg(self, level: int, *args) -> None:
+        """Print to terminal if DEBUG in CalibratorUI.ini [debug] is >= level."""
+        if self._debug_level < level:
+            return
+        print("[CalibratorUI DBG%d]" % level, *args, flush=True)
+
     def __init__(self, win: QMainWindow) -> None:
         self._win = win
         self._ini = load_ini()
+        self._debug_level = self._read_debug_level()
+        try:
+            sys.stderr.write(
+                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout trace: [debug] DEBUG=1..9)\n"
+                % (CALIBRATOR_UI_VERSION, _INI_PATH, self._debug_level)
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         self._serial: serial.Serial | None = None
         # Yellow "Connected" LED when serial is open but Pico reports fault (wired later).
         self._pico_has_error: bool = False
@@ -279,6 +362,7 @@ class CalibratorController:
         self._pico_alive_stale: bool = False
         self._last_alive_reply_ts: float | None = None
         self._connect_mono_ts: float | None = None
+        self._keepalive_stale_dbg_done: bool = False
         # Placeholders until host↔Pico protocol (set mA ack, closed-loop telem).
         self._configured_ok: bool = False
         self._closed_loop_ok: bool = False
@@ -355,6 +439,10 @@ class CalibratorController:
             raise RuntimeError("UI missing pushButton_SafeCalibrator")
 
         self._rx_buf = bytearray()
+        # Last (display_text, stylesheet) per QLCDNumber — skip redundant setStyleSheet (expensive at TM rate).
+        self._lcd_meas_cache: dict[str, tuple[str, str]] = {}
+        self._lcd_volts_cache: dict[str, tuple[str, str]] = {}
+        self._connect_rx_pump_slices: int = 0
         self._serial_timer = QTimer(self._win)
         self._serial_timer.setInterval(50)
         self._serial_timer.timeout.connect(self._poll_serial)
@@ -389,6 +477,8 @@ class CalibratorController:
         self._apply_settings_from_ini()
 
         self._setup_settings_menu()
+        self._sync_soft_reset_menu_from_ini()
+        self._setup_help_menu()
 
         self._btn_connect.clicked.connect(self._on_connect_clicked)
         self._btn_safe.clicked.connect(self._on_safe_calibrator)
@@ -402,6 +492,7 @@ class CalibratorController:
 
         self._set_connected_ui(False)
         self._set_status("Ready.")
+        self._dbg(1, "startup; DEBUG level", self._debug_level, "ini", _INI_PATH)
 
     def _populate_baud_combo(self) -> None:
         self._combo_baud.clear()
@@ -447,6 +538,16 @@ class CalibratorController:
     def _settings_persist_to_ini(self) -> None:
         self._ini.set("settings", "pwm_freq_hz", str(self._settings_pwm_hz))
         self._ini.set("settings", "max_ma_mA", str(self._settings_max_ma))
+        mb = self._win.menuBar()
+        for a in mb.actions():
+            m = a.menu()
+            if m is not None and m.title().replace("&", "") == "Settings":
+                sr = self._find_menu_action(m, "Soft reset on connect")
+                if sr is not None:
+                    self._ini.set(
+                        "serial", "soft_reset_on_connect", "1" if sr.isChecked() else "0"
+                    )
+                break
         save_ini(self._ini)
 
     @staticmethod
@@ -465,6 +566,46 @@ class CalibratorController:
         a.triggered.connect(slot)
         menu.addAction(a)
 
+    @staticmethod
+    def _find_menu_action(menu, label_plain: str) -> QAction | None:
+        for act in menu.actions():
+            if act.isSeparator():
+                continue
+            if act.text().replace("&", "") == label_plain:
+                return act
+        return None
+
+    def _soft_reset_on_connect_pref(self) -> bool:
+        try:
+            return self._ini.getboolean("serial", "soft_reset_on_connect", fallback=False)
+        except ValueError:
+            return False
+
+    def _sync_soft_reset_menu_from_ini(self) -> None:
+        mb = self._win.menuBar()
+        sm = None
+        for a in mb.actions():
+            m = a.menu()
+            if m is not None and m.title().replace("&", "") == "Settings":
+                sm = m
+                break
+        if sm is None:
+            return
+        act = self._find_menu_action(sm, "Soft reset on connect")
+        if act is None:
+            return
+        act.blockSignals(True)
+        act.setChecked(self._soft_reset_on_connect_pref())
+        act.blockSignals(False)
+
+    def _on_soft_reset_on_connect_toggled(self, on: bool) -> None:
+        self._ini.set("serial", "soft_reset_on_connect", "1" if on else "0")
+        save_ini(self._ini)
+        self._set_status(
+            "Soft reset on connect: %s (saved to CalibratorUI.ini)."
+            % ("on — use when Pico is stuck in >>> REPL" if on else "off — normal when firmware is already running")
+        )
+
     def _setup_settings_menu(self) -> None:
         """Wires Settings: create menu if missing; add only actions not already in .ui."""
         mb = self._win.menuBar()
@@ -482,6 +623,90 @@ class CalibratorController:
             sm.addSeparator()
         self._ensure_menu_action(sm, "Frequency...", self._settings_dialog_frequency)
         self._ensure_menu_action(sm, "Max Current...", self._settings_dialog_max_ma)
+        if not self._menu_has_action(sm, "Soft reset on connect"):
+            sm.addSeparator()
+            sr = QAction("Soft reset on connect", self._win)
+            sr.setCheckable(True)
+            sr.setToolTip(
+                "When on, Connect sends Ctrl+C and Ctrl+D (MicroPython soft reset). "
+                "Use only if the Pico is stuck at the >>> REPL. When off (default), Connect talks to a running app "
+                "(e.g. READY DEPLOY / SAFE) without resetting."
+            )
+            sr.toggled.connect(self._on_soft_reset_on_connect_toggled)
+            sm.addAction(sr)
+
+    def _setup_help_menu(self) -> None:
+        act = self._win.findChild(QAction, "actionAbout_Calibrator")
+        if act is not None:
+            act.triggered.connect(self._show_help_about_dialog)
+            return
+        mb = self._win.menuBar()
+        for top in mb.actions():
+            m = top.menu()
+            if m is not None and m.title().replace("&", "") == "Help":
+                sub = self._find_menu_action(m, _HELP_ABOUT_TITLE)
+                if sub is not None:
+                    sub.triggered.connect(self._show_help_about_dialog)
+                else:
+                    a = QAction(_HELP_ABOUT_TITLE, self._win)
+                    a.triggered.connect(self._show_help_about_dialog)
+                    m.addAction(a)
+                return
+        hm = mb.addMenu("Help")
+        a = QAction(_HELP_ABOUT_TITLE, self._win)
+        a.triggered.connect(self._show_help_about_dialog)
+        hm.addAction(a)
+
+    def _show_help_about_dialog(self) -> None:
+        dlg = QDialog(self._win)
+        dlg.setWindowTitle(_HELP_ABOUT_TITLE)
+        dlg.setModal(True)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #1a1d2e; color: #e8e8e8; }"
+            "QLabel { color: #e8e8e8; }"
+            "QPushButton { background-color: #2d334d; color: #e8e8e8; padding: 6px 18px; "
+            "border: 1px solid #3d4666; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #3a4260; }"
+        )
+        lay = QVBoxLayout(dlg)
+        logo_path = _resolve_about_logo_path()
+        if logo_path is not None:
+            pix = QPixmap(str(logo_path))
+            if not pix.isNull():
+                max_w = 560
+                if pix.width() > max_w:
+                    pix = pix.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
+                im = QLabel()
+                im.setPixmap(pix)
+                im.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+                lay.addWidget(im)
+        if self._serial is None:
+            pico_html = html.escape("Pico: not connected")
+        elif self._pico_version:
+            pico_html = "Pico firmware version: " + html.escape(self._pico_version)
+        else:
+            pico_html = html.escape("Pico: connected — firmware version not reported yet")
+        ver_ui = html.escape(CALIBRATOR_UI_VERSION)
+        email_e = html.escape(_ABOUT_CONTACT_EMAIL)
+        info = QLabel(
+            "<p style='margin-top:12px;'><b>Calibrator host application</b></p>"
+            "<p>Calibrator UI version: <b>%s</b><br/>%s</p>"
+            "<p><b>Python libraries</b></p>"
+            "<p>PySide6<br/>pyserial</p>"
+            "<p><b>Attribution</b></p>"
+            "<p>Primary author &amp; contact: "
+            '<a href="mailto:%s" style="color:#7eb6ff;">%s</a><br/>'
+            "Editor and AI-assisted development: Cursor</p>"
+            % (ver_ui, pico_html, email_e, email_e)
+        )
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.TextFormat.RichText)
+        info.setOpenExternalLinks(True)
+        lay.addWidget(info)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        lay.addWidget(buttons)
+        dlg.exec()
 
     def _settings_save(self) -> None:
         self._settings_persist_to_ini()
@@ -489,9 +714,12 @@ class CalibratorController:
 
     def _settings_restore(self) -> None:
         self._ini = load_ini()
+        self._debug_level = self._read_debug_level()
         self._apply_settings_from_ini()
         self._apply_ini_to_widgets()
+        self._sync_soft_reset_menu_from_ini()
         self._set_status("Settings restored from CalibratorUI.ini.")
+        self._dbg(1, "settings restore; DEBUG level now", self._debug_level)
 
     def _settings_dialog_frequency(self) -> None:
         dlg = QDialog(self._win)
@@ -590,6 +818,49 @@ class CalibratorController:
         """Append one line to the Calibrator log (TXT:: payload, no prefix)."""
         self._text_out.append(text.rstrip("\r\n"))
         self._text_out.moveCursor(QTextCursor.MoveOperation.End)
+        doc = self._text_out.document()
+        n = doc.blockCount()
+        if n > _MAX_PICO_LOG_BLOCKS:
+            excess = n - _MAX_PICO_LOG_BLOCKS
+            cur = QTextCursor(doc)
+            cur.movePosition(QTextCursor.MoveOperation.Start)
+            start = cur.position()
+            moved = 0
+            while moved < excess and cur.movePosition(
+                QTextCursor.MoveOperation.NextBlock,
+                QTextCursor.MoveMode.MoveAnchor,
+            ):
+                moved += 1
+            if moved > 0:
+                cur.setPosition(start, QTextCursor.MoveMode.KeepAnchor)
+                cur.removeSelectedText()
+                self._text_out.moveCursor(QTextCursor.MoveOperation.End)
+                self._dbg(
+                    1,
+                    "log: trimmed",
+                    moved,
+                    "oldest block(s); cap",
+                    _MAX_PICO_LOG_BLOCKS,
+                )
+
+    @staticmethod
+    def _lcd_key(lcd: QLCDNumber) -> str:
+        return lcd.objectName() or str(id(lcd))
+
+    def _lcd_set_if_changed(
+        self,
+        lcd: QLCDNumber,
+        text: str,
+        style: str,
+        cache: dict[str, tuple[str, str]],
+    ) -> None:
+        key = self._lcd_key(lcd)
+        t = (text, style)
+        if cache.get(key) == t:
+            return
+        lcd.display(text)
+        lcd.setStyleSheet(style)
+        cache[key] = t
 
     def _try_parse_pico_version_from_txt_payload(self, payload: str) -> None:
         """Recognize boot STATUS VERSION … or command reply OK VERSION … from Pico."""
@@ -599,6 +870,7 @@ class CalibratorController:
             self._pico_version = m.group(1)
             self._note_pico_liveness()
             self._refresh_connection_status_line()
+            self._dbg(1, "Pico firmware version (OK VERSION):", self._pico_version)
             return
         parts = s.split()
         for i, p in enumerate(parts):
@@ -608,6 +880,7 @@ class CalibratorController:
                     self._pico_version = ver
                     self._note_pico_liveness()
                     self._refresh_connection_status_line()
+                    self._dbg(1, "Pico firmware version (boot text):", self._pico_version)
                 return
 
     def _refresh_connection_status_line(self) -> None:
@@ -628,6 +901,24 @@ class CalibratorController:
             self._status_conn.setText(
                 f"Connection: Connected ({port} @ {baud} baud) — Pico ...{suffix}"
             )
+
+    @staticmethod
+    def _line_looks_like_tm_telemetry(s: str) -> bool:
+        """True if line is TM:: or a coil_driver-style key=value telemetry row (even when framing drops TM::)."""
+        t = s.strip()
+        if not t:
+            return False
+        if re.match(r"(?i)^TXT::", t) or t.upper().startswith("STATUS"):
+            return False
+        if re.match(r"(?i)^TM::\s*", t):
+            return True
+        return bool(
+            re.search(
+                r"(?:^|\s)(?:meas_ok|X_ma|Y_ma|Z_ma|set_[XYZ]_ma|closed_loop|coil_V_[XYZ]|"
+                r"diag_Ch[123]_ma|diag_[XYZ]_duty|alarm)\s*=",
+                t,
+            )
+        )
 
     @staticmethod
     def _parse_tm_tokens(line: str) -> dict[str, str]:
@@ -670,12 +961,12 @@ class CalibratorController:
         meas_ok = self._tm_int(kv, "meas_ok")
         if meas_ok is None:
             meas_ok = 1  # legacy TM lines without meas_ok
+        nodata_style = (
+            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
+        )
         for ax, sp, _pb, lcd, _chk in self._axis_rows:
             if meas_ok == 0:
-                lcd.display("---")
-                lcd.setStyleSheet(
-                    f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-                )
+                self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_meas_cache)
                 continue
             m = self._tm_float(kv, f"{ax}_ma")
             tgt = self._tm_float(kv, f"set_{ax}_ma")
@@ -685,14 +976,15 @@ class CalibratorController:
             if lim is None:
                 lim = float(self._settings_max_ma)
             if m is None:
-                lcd.display("---")
-                lcd.setStyleSheet(
-                    f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-                )
+                self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_meas_cache)
                 continue
-            lcd.display(f"{m:.1f}")
             c = _meas_lcd_digit_color(m, tgt, lim)
-            lcd.setStyleSheet(f"background-color: {_MEAS_LCD_BG}; color: {c};")
+            self._lcd_set_if_changed(
+                lcd,
+                f"{m:.1f}",
+                f"background-color: {_MEAS_LCD_BG}; color: {c};",
+                self._lcd_meas_cache,
+            )
 
         self._update_volts_lcds_from_tm(kv)
 
@@ -701,35 +993,33 @@ class CalibratorController:
         meas_ok = self._tm_int(kv, "meas_ok")
         if meas_ok is None:
             meas_ok = 1
+        nodata_style = (
+            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
+        )
         for ax, lcd in self._axis_volts_lcd:
             if meas_ok == 0:
-                lcd.display("---")
-                lcd.setStyleSheet(
-                    f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-                )
+                self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_volts_cache)
                 continue
             v = self._tm_float(kv, f"coil_V_{ax}")
             if v is None:
-                lcd.display("---")
-                lcd.setStyleSheet(
-                    f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-                )
+                self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_volts_cache)
                 continue
-            lcd.display(f"{v:.2f}")
             c = _volts_lcd_digit_color(v)
-            lcd.setStyleSheet(f"background-color: {_MEAS_LCD_BG}; color: {c};")
+            self._lcd_set_if_changed(
+                lcd,
+                f"{v:.2f}",
+                f"background-color: {_MEAS_LCD_BG}; color: {c};",
+                self._lcd_volts_cache,
+            )
 
     def _reset_measured_lcds_no_data(self) -> None:
+        nodata_style = (
+            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
+        )
         for _ax, _sp, _pb, lcd, _chk in self._axis_rows:
-            lcd.display("---")
-            lcd.setStyleSheet(
-                f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-            )
+            self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_meas_cache)
         for _ax, lcd in self._axis_volts_lcd:
-            lcd.display("---")
-            lcd.setStyleSheet(
-                f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-            )
+            self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_volts_cache)
 
     def _on_safe_calibrator(self) -> None:
         """Immediate SAFE: Pico enters latched Safe State (PWM off); no delay."""
@@ -737,6 +1027,7 @@ class CalibratorController:
             self._set_status("Not connected.")
             return
         try:
+            self._dbg(1, "action: SAFE (safe)")
             self._serial.write(b"safe\r\n")
             self._serial.flush()
             self._set_status("SAFE sent.")
@@ -749,6 +1040,7 @@ class CalibratorController:
             self._set_status("Not connected.")
             return
         try:
+            self._dbg(1, "action: Reset (safe_reset)")
             self._serial.write(b"safe_reset\r\n")
             self._serial.flush()
             self._set_status("Reset (safe_reset) sent.")
@@ -772,15 +1064,18 @@ class CalibratorController:
         val = float(spin.value())
         axl = axis.lower()
         hz = self._settings_pwm_hz
-        lines = [
-            f"set_{axl}_ma {val:.2f}\r\n",
-            f"set_{axl}_pwm_hz {hz}\r\n",
-        ]
+        # One USB write: avoids Pico/USB dropping or reordering rapid separate writes.
+        # PWM Hz before mA so a freq() change cannot clear duty right after set_*_ma is applied.
+        blob = (
+            b"safe_reset\r\n"
+            + f"set_{axl}_pwm_hz {hz}\r\n".encode("ascii", errors="replace")
+            + f"set_{axl}_ma {val:.2f}\r\n".encode("ascii", errors="replace")
+        )
         try:
-            # Pico latches SAFE on `safe`; set_*_ma / set_*_pwm_hz are refused until safe_reset.
-            self._serial.write(b"safe_reset\r\n")
-            for line in lines:
-                self._serial.write(line.encode("ascii", errors="replace"))
+            self._dbg(1, "action: Set", axis, f"{val:.2f} mA", "PWM", hz, "Hz")
+            if self._debug_level >= 2:
+                self._dbg(2, "Set TX bytes", len(blob))
+            self._serial.write(blob)
             self._serial.flush()
             self._set_status(
                 f"Set {axis}: {val:.2f} mA, PWM {hz} Hz"
@@ -813,6 +1108,7 @@ class CalibratorController:
             self._settle = s != 0
         self._update_status_leds()
         self._update_measured_lcds_from_tm(kv)
+        self._note_pico_liveness()
 
     def _process_serial_line(self, line: str) -> None:
         s = line.strip("\r\n").strip()
@@ -820,6 +1116,8 @@ class CalibratorController:
             s = s[1:].lstrip()
         if not s:
             return
+        if self._debug_level >= 3 and not re.match(r"(?i)^TM::", s):
+            self._dbg(3, "RX (non-TM)", repr(s)[:500])
         # Case-insensitive prefix; length-safe payload (handles TXT:: vs TXT::␠ from firmware).
         m_txt = re.match(r"(?i)^TXT::\s*", s)
         if m_txt:
@@ -827,39 +1125,114 @@ class CalibratorController:
             if payload.strip() == "OK ALIVE":
                 self._note_pico_liveness()
                 return
+            self._note_pico_liveness()
+            if self._debug_level >= 2:
+                self._dbg(2, "TXT", payload[:220].replace("\r", " "))
             self._try_parse_pico_version_from_txt_payload(payload)
             self._append_pico_log_line(payload)
             return
         if re.match(r"(?i)^TM::", s):
             self._apply_tm_line(s)
             return
+        if self._line_looks_like_tm_telemetry(s):
+            self._apply_tm_line(s)
+            return
         # Anything else (unprefixed boot noise, mis-framed lines): show so nothing is silent.
+        if self._debug_level >= 2:
+            self._dbg(2, "OTHER (unprefixed)", s[:220].replace("\r", " "))
         self._append_pico_log_line(s)
 
-    def _poll_serial(self) -> None:
+    def _serial_drain_bytes_only(self) -> int:
+        """Read USB CDC into _rx_buf only (no line parsing). Used during Connect wait loops."""
+        if self._serial is None:
+            return 0
+        try:
+            chunk = self._serial.read(4096)
+            if chunk:
+                self._rx_buf.extend(chunk)
+                return len(chunk)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _serial_clear_dtr_rts(ser: serial.Serial) -> None:
+        """Avoid RP2040 reset / CDC glitch when the OS toggles control lines on port open (common on Windows)."""
+        try:
+            ser.dtr = False
+            ser.rts = False
+        except (AttributeError, ValueError, OSError):
+            pass
+
+    def _connect_rx_pump_slice(self) -> None:
+        """Spread post-connect RX processing across timer slices so the window stays responsive."""
+        if self._serial is None:
+            self._connect_rx_pump_slices = 0
+            return
+        self._connect_rx_pump_slices += 1
+        if self._connect_rx_pump_slices > _CONNECT_RX_PUMP_MAX_SLICES:
+            self._dbg(1, "connect: RX pump stopped (slice cap)")
+            self._connect_rx_pump_slices = 0
+            pl = 5
+            QTimer.singleShot(20, lambda pl=pl: self._post_connect_serial_catchup(pl))
+            return
+        QApplication.processEvents()
+        self._poll_serial(max_lines=_CONNECT_RX_PUMP_SLICE_LINES)
+        pending = bool(self._rx_buf)
+        try:
+            if self._serial.in_waiting > 0:
+                pending = True
+        except Exception:
+            pass
+        if pending:
+            QTimer.singleShot(1, self._connect_rx_pump_slice)
+        else:
+            self._connect_rx_pump_slices = 0
+            # Windows CDC can deliver hw_report/TXT:: a few ms after the pump sees an empty buffer.
+            pl = 5
+            QTimer.singleShot(20, lambda pl=pl: self._post_connect_serial_catchup(pl))
+
+    def _post_connect_serial_catchup(self, passes_left: int) -> None:
+        if self._serial is None or passes_left <= 0:
+            return
+        self._poll_serial()
+        if passes_left > 1:
+            nxt = passes_left - 1
+            QTimer.singleShot(50, lambda n=nxt: self._post_connect_serial_catchup(n))
+
+    def _poll_serial(self, max_lines: int | None = None) -> None:
         if self._serial is None:
             return
+        if max_lines is None:
+            line_cap = _MAX_SERIAL_LINES_PER_TICK
+        else:
+            line_cap = max(1, min(int(max_lines), _MAX_SERIAL_LINES_PER_TICK))
         try:
             # Drain up to 4 KiB per tick. On Windows, in_waiting can stay 0 until read() runs.
             chunk = self._serial.read(4096)
             if chunk:
                 self._rx_buf.extend(chunk)
+                if self._debug_level >= 2:
+                    self._dbg(2, "serial read", len(chunk), "bytes; rx_buf total", len(self._rx_buf))
         except Exception:
             return
-        while True:
-            # Support \n, \r\n, and \r-only; \r-only never matches find(b"\n") alone.
+        processed = 0
+        while processed < line_cap:
+            # Prefer \n so a stray \r mid-line (before \n) does not split TM:: rows (fixes ".00 Y_ma=" garbage).
             nl = self._rx_buf.find(b"\n")
-            cr = self._rx_buf.find(b"\r")
-            if nl >= 0 and (cr < 0 or nl < cr):
+            if nl >= 0:
                 raw = bytes(self._rx_buf[:nl])
                 del self._rx_buf[: nl + 1]
-                if raw.endswith(b"\r"):
+                while raw.endswith(b"\r"):
                     raw = raw[:-1]
-            elif cr >= 0:
-                raw = bytes(self._rx_buf[: cr])
-                del self._rx_buf[: cr + 1]
             else:
-                break
+                cr = self._rx_buf.find(b"\r")
+                if cr >= 0:
+                    raw = bytes(self._rx_buf[:cr])
+                    del self._rx_buf[: cr + 1]
+                else:
+                    break
+            processed += 1
             try:
                 text = raw.decode("utf-8", errors="replace")
             except Exception:
@@ -873,6 +1246,18 @@ class CalibratorController:
                     )
                 except Exception:
                     pass
+        if self._debug_level >= 1 and processed >= line_cap:
+            nl = self._rx_buf.find(b"\n")
+            cr = self._rx_buf.find(b"\r")
+            if nl >= 0 or cr >= 0:
+                self._dbg(
+                    1,
+                    "serial: processed",
+                    processed,
+                    "lines this tick (cap);",
+                    len(self._rx_buf),
+                    "bytes still buffered with more line(s) pending",
+                )
         self._check_pico_alive_stale()
 
     def _note_pico_liveness(self) -> None:
@@ -899,6 +1284,16 @@ class CalibratorController:
             self._pico_alive_stale = stale
             self._update_status_leds()
             self._refresh_connection_status_line()
+            if stale:
+                if not self._keepalive_stale_dbg_done:
+                    self._dbg(
+                        1,
+                        "keepalive: marked STALE (no Pico traffic in time window — TXT/TM/OK ALIVE)",
+                    )
+                    self._keepalive_stale_dbg_done = True
+            else:
+                self._keepalive_stale_dbg_done = False
+                self._dbg(1, "keepalive: recovered (Pico traffic seen)")
 
     def _update_status_leds(self) -> None:
         """Connected: red/yellow/green. Configured / closed loop: wired when protocol exists."""
@@ -992,12 +1387,28 @@ class CalibratorController:
         baud = self._current_baud()
         try:
             # timeout=0: non-blocking reads in _poll_serial (Windows often needs read() not only in_waiting).
-            self._serial = serial.Serial(port, baud, timeout=0)
+            self._serial = serial.Serial(
+                port,
+                baud,
+                timeout=0,
+                write_timeout=2,
+                dsrdtr=False,
+                rtscts=False,
+            )
+            self._serial_clear_dtr_rts(self._serial)
         except Exception as e:
             self._set_status(f"Open failed: {e}")
             QMessageBox.critical(self._win, "Calibrator", f"Could not open {port}:\n{e}")
             self._serial = None
             return
+        self._dbg(
+            1,
+            "connect: opened",
+            port,
+            baud,
+            "soft_reset_on_connect=",
+            int(self._soft_reset_on_connect_pref()),
+        )
         self._pico_has_error = False
         self._configured_ok = False
         self._closed_loop_ok = False
@@ -1008,34 +1419,57 @@ class CalibratorController:
         self._pico_version = None
         self._pico_alive_stale = False
         self._last_alive_reply_ts = None
+        self._keepalive_stale_dbg_done = False
         self._connect_mono_ts = time.monotonic()
         self._save_serial_ini()
         self._rx_buf.clear()
-        # Do not reset_input_buffer here: opening COM often resets the Pico; clearing RX would
-        # discard boot TXT:: lines and the reply to gui_status. Let the first poll() drain data.
-        self._serial_timer.start()
-        self._heartbeat_timer.start()
+        self._connect_rx_pump_slices = 0
+        # Do not start serial/heartbeat timers until after the handshake wait: otherwise
+        # processEvents() during the wait runs _poll_serial and floods QTextEdit (Not Responding).
         self._reset_measured_lcds_no_data()
         self._set_connected_ui(True)
         self._set_status(f"Opened {port} @ {baud} baud.")
-        # Exit stuck >>> REPL or restart app: Ctrl+C (0x03) then Ctrl+D (0x04) = soft reset → main.py runs again.
-        try:
-            self._serial.write(b"\x03\x04")
-            self._serial.flush()
-        except Exception:
-            pass
-        self._set_status("Pico soft reset sent; waiting for boot…")
-        # Keep processing Qt events so _poll_serial (50 ms) drains USB during MicroPython restart.
-        t_boot = time.monotonic() + 1.6
-        while time.monotonic() < t_boot:
-            QApplication.processEvents()
-            time.sleep(0.02)
+        if self._soft_reset_on_connect_pref():
+            # Stuck >>> REPL: Ctrl+C then Ctrl+D = soft reset → main.py runs again.
+            try:
+                self._serial.write(b"\x03\x04")
+                self._serial.flush()
+            except Exception:
+                pass
+            self._set_status("Pico soft reset sent; waiting for boot…")
+            self._dbg(1, "connect: sent soft reset (Ctrl+C Ctrl+D); boot wait 1.6s")
+            t_boot = time.monotonic() + 1.6
+            settle_bytes = 0
+            while time.monotonic() < t_boot:
+                QApplication.processEvents()
+                time.sleep(0.02)
+                settle_bytes += self._serial_drain_bytes_only()
+            self._dbg(1, "connect: boot-wait drained", settle_bytes, "raw bytes (pre-handshake)")
+        else:
+            # Firmware already running (e.g. READY DEPLOY / SAFE): do not reset; drain CDC and query.
+            self._set_status("Connecting (no soft reset)…")
+            self._dbg(
+                1,
+                "connect: no soft reset; settle %.2fs + drain serial"
+                % (_CONNECT_SETTLE_NO_SOFT_RESET_S,),
+            )
+            t_settle = time.monotonic() + _CONNECT_SETTLE_NO_SOFT_RESET_S
+            settle_bytes = 0
+            while time.monotonic() < t_settle:
+                QApplication.processEvents()
+                time.sleep(0.02)
+                settle_bytes += self._serial_drain_bytes_only()
+            self._dbg(1, "connect: settle drained", settle_bytes, "raw bytes (pre-handshake)")
         try:
             self._serial.write(b"version\r\nhw_report\r\n")
             self._serial.flush()
+            self._dbg(1, "connect: sent version + hw_report")
         except Exception:
             pass
         self._set_status(f"Opened {port} @ {baud} baud.")
+        self._serial_timer.start()
+        self._heartbeat_timer.start()
+        QTimer.singleShot(0, self._connect_rx_pump_slice)
 
     def _send_pico_link_heartbeat(self) -> None:
         """Pico: alive refreshes slave LCD link and returns OK ALIVE for host liveness."""
@@ -1048,9 +1482,12 @@ class CalibratorController:
             pass
 
     def _disconnect(self) -> None:
+        self._dbg(1, "disconnect: stopping timers and closing serial")
+        self._connect_rx_pump_slices = 0
         self._connect_mono_ts = None
         self._last_alive_reply_ts = None
         self._pico_alive_stale = False
+        self._keepalive_stale_dbg_done = False
         self._heartbeat_timer.stop()
         self._serial_timer.stop()
         self._rx_buf.clear()
@@ -1067,6 +1504,8 @@ class CalibratorController:
             except Exception:
                 pass
             self._serial = None
+        self._lcd_meas_cache.clear()
+        self._lcd_volts_cache.clear()
         self._pico_has_error = False
         self._configured_ok = False
         self._closed_loop_ok = False
@@ -1090,7 +1529,7 @@ def main() -> int:
     win = _load_ui()
     if win is None:
         return 1
-    win.setWindowTitle("Calibrator")
+    win.setWindowTitle("Calibrator — UI %s" % CALIBRATOR_UI_VERSION)
 
     try:
         ctrl = CalibratorController(win)

@@ -566,9 +566,16 @@
     <addaction name="actionFrequeny"/>
     <addaction name="actionMax_Current"/>
    </widget>
+   <widget class="QMenu" name="menuHelp">
+    <property name="title">
+     <string>Help</string>
+    </property>
+    <addaction name="actionAbout_Calibrator"/>
+   </widget>
    <addaction name="menuFile"/>
    <addaction name="menuConnection"/>
    <addaction name="menuSettings"/>
+   <addaction name="menuHelp"/>
   </widget>
   <widget class="QStatusBar" name="statusbar"/>
   <action name="actionExit">
@@ -594,6 +601,11 @@
   <action name="actionMax_Current">
    <property name="text">
     <string>Max Current</string>
+   </property>
+  </action>
+  <action name="actionAbout_Calibrator">
+   <property name="text">
+    <string>About Calibrator</string>
    </property>
   </action>
  </widget>
