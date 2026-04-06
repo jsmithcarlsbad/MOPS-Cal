@@ -13,6 +13,19 @@ INA3221_ADDRESS = 0x40
 INA3221_SHUNT_OHMS = 0.1
 # Map INA3221 channel index 0,1,2 → logical X,Y,Z (reorder if wiring differs)
 INA3221_AXIS_ORDER = (0, 1, 2)
+# --- GPIO ↔ axis (drv8871_3ch) — order is always X, Y, Z ---
+#   Axis | IN1 (hardware PWM) | IN2 (GPIO held low)
+#   X    | GP10               | GP11
+#   Y    | GP12               | GP13
+#   Z    | GP14               | GP15
+# RP2040 PWM: slice = (GP >> 1) & 7, channel A/B = GP & 1 (even GP → ch A). Firmware derives slice/ch from IN1 pins for INA sync.
+# 1 = align INA3221 shunt+bus reads to middle of PWM **off** time (quietest RC node); 0 = read immediately.
+INA3221_BUS_V_SYNC_PWM = 1
+# Busy-wait budget (µs) per axis before sampling anyway (~15 periods at 5 kHz ≈ 3 ms).
+INA3221_BUS_V_SYNC_TIMEOUT_US = 3000
+# Sample window half-width: max(1, off_ticks >> INA3221_BUS_V_SYNC_OFF_CENTER_SHIFT). Larger = looser timing.
+INA3221_BUS_V_SYNC_OFF_CENTER_SHIFT = 4
+# If slice runs phase-correct (CSR PH_CORRECT), off-window math is skipped; fall back to mid-period alignment.
 
 # --- Freenove 2×16 I2C LCD (PCF8574) — I2C1 only; not shared with INA3221 ---
 # Freenove’s Pico *demo* uses I2C0 on GP4/GP5; this project uses I2C1 on GP2/GP3 instead.
@@ -101,5 +114,12 @@ SERIAL_BAUD = 115200  # USB CDC; baud ignored on native USB, kept for docs
 
 # LCD: line 1 status + line 2 mA. Minimum ms between paints (slower is fine). Values < 100 are clamped to 100 (10 Hz max).
 LCD_REFRESH_MS = 100
+# At boot: clear LCD, show 3DHC-Calibrator + VER line (centered), then hold this many seconds before normal screens.
+BOOT_LCD_SPLASH_S = 5.0
 # C=1 if host sent a serial line within this window (ms)
 HOST_LINK_TIMEOUT_MS = 5000
+
+# NO switch to GND = emergency deploy-ready: internal pull-up, falling-edge IRQ → all PWM off + DEPLOY_READY.
+# 0 = disabled. Default GP16 avoids DRV8871 (10–15) and I2C (2–3, 4–5).
+HARDWARE_ESTOP_GP = 16
+HARDWARE_ESTOP_DEBOUNCE_MS = 80

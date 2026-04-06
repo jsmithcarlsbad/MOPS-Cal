@@ -51,6 +51,21 @@ class INA3221:
         v_shunt = raw * _SHUNT_UV_LSB
         return (v_shunt / self._r) * 1000.0
 
+    def current_ma_and_bus_voltage_v(self, channel):
+        """Read shunt then bus register for one channel back-to-back (mA, V).
+
+        INA3221 does not expose simultaneous sampling; this pairs reads as tightly
+        as I2C allows after host-side PWM phase alignment.
+        """
+        if channel < 0 or channel > 2:
+            raise ValueError("channel 0..2")
+        raw_s = self._read_s16(_REG_SHUNT[channel])
+        raw_b = self._read_u16(_REG_BUS[channel])
+        v_shunt = raw_s * _SHUNT_UV_LSB
+        i_ma = (v_shunt / self._r) * 1000.0
+        v_bus = ((raw_b >> 3) & 0x1FFF) * _BUS_V_LSB
+        return i_ma, v_bus
+
     def bus_voltage_v(self, channel):
         """Bus (load-side) voltage for channel 0, 1, or 2 (volts)."""
         if channel < 0 or channel > 2:

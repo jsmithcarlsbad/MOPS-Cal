@@ -4,6 +4,7 @@
 import sys
 import time
 import micropython
+import machine
 from machine import I2C, Pin, PWM, Timer
 
 import config
@@ -11,7 +12,7 @@ import config
 # Firmware version (single source of truth). Bump MAJOR for large / incompatible changes;
 # bump MINOR for bug fixes and small additions.
 VERSION_MAJOR = 3
-VERSION_MINOR = 4
+VERSION_MINOR = 21
 VERSION = "%d.%d" % (VERSION_MAJOR, VERSION_MINOR)
 
 
@@ -20,10 +21,34 @@ def host_print(*args):
     print("TXT:: " + " ".join(str(a) for a in args))
 
 
+def _scheduled_tm_line(arg):
+    """Print TM:: in main context. Timer ISR must not print — USB CDC interleaves with TXT:: from main."""
+    global _host_txt_burst_active
+    if _host_txt_burst_active:
+        return
+    try:
+        print(arg)
+    except Exception:
+        pass
+
+
+def _scheduled_tm_err(arg):
+    global _host_txt_burst_active
+    if _host_txt_burst_active:
+        return
+    try:
+        host_print("STATUS TM_ERR", arg)
+    except Exception:
+        pass
+
+
 # --- Hardware handles ---
 i2c = None
 mon = None
 pwms = []
+# RP2040 PWM slice (0..7) and channel (0=A, 1=B) per axis for INA off-window sync; set in _init_hardware from IN1 GPIO.
+_pwm_slice_for_axis = (-1, -1, -1)
+_pwm_cc_chan_per_axis = (0, 0, 0)
 # DRV8871: IN2 GPIO per axis (IN1 uses hardware PWM in pwms); unused for other COIL_DRIVER_HW.
 _drv8871_in2_pins = [None, None, None]
 lcd = None
@@ -32,17 +57,30 @@ lcd_i2c_addr_used = None
 # One I2C object per hardware block — creating I2C(1,…) twice (init + hw_report) breaks the LCD driver.
 _lcd_bus_instance = None
 
+# True while _report_hardware_to_host runs: scheduled TM:: must not print (still interleaves with TXT:: on USB).
+_host_txt_burst_active = False
 
 def _axis_order():
     return tuple(getattr(config, "INA3221_AXIS_ORDER", (0, 1, 2)))
 
 
+def _axis_index_for_ina_ch(ina_ch: int) -> int:
+    """Coil axis index 0..2 (X..Z) that drives the PWM aligned with INA channel ina_ch."""
+    order = _axis_order()
+    for ax in range(3):
+        if int(order[ax]) == int(ina_ch):
+            return ax
+    return 0
+
+
 def _init_hardware():
-    global i2c, mon, pwms, _drv8871_in2_pins
+    global i2c, mon, pwms, _drv8871_in2_pins, _pwm_slice_for_axis, _pwm_cc_chan_per_axis
     i2c = None
     mon = None
     pwms = []
     _drv8871_in2_pins = [None, None, None]
+    _pwm_slice_for_axis = (-1, -1, -1)
+    _pwm_cc_chan_per_axis = (0, 0, 0)
     try:
         i2c = I2C(
             int(getattr(config, "I2C_ID", 0)),
@@ -111,6 +149,135 @@ def _init_hardware():
                 pwms.append(None)
     while len(pwms) < 3:
         pwms.append(None)
+
+    # RP2040: slice = (GPIO >> 1) & 7, channel A/B = GPIO & 1 (0=A, 1=B). Matches MicroPython PWM routing.
+    if hw == "drv8871_3ch":
+        pin_list = list(getattr(config, "DRV8871_IN1_PWM_PINS", (10, 12, 14)))
+    else:
+        pin_list = list(getattr(config, "PWM_EN_PINS", (10, 12, 14)))
+    sl = [-1, -1, -1]
+    cc = [0, 0, 0]
+    for i in range(3):
+        try:
+            g = int(pin_list[i])
+            sl[i] = (g >> 1) & 7
+            cc[i] = g & 1
+        except Exception:
+            pass
+    _pwm_slice_for_axis = (sl[0], sl[1], sl[2])
+    _pwm_cc_chan_per_axis = (cc[0], cc[1], cc[2])
+
+
+def _pwm_ctr_ring_dist(ctr, target, period):
+    """Circular distance between counter and target on 0..period-1."""
+    d = ctr - target
+    if d < 0:
+        d = -d
+    half = period >> 1
+    if d > half:
+        d = period - d
+    return d
+
+
+def _pwm_sync_wait_period_mid_slice(sn, timeout_us, sh):
+    """Fallback when slice CSR.PH_CORRECT=1: align to middle of full period (off is split on up/down ramp)."""
+    if sn < 0 or sn > 7:
+        return
+    base = 0x40050000 + sn * 0x14
+    t0 = time.ticks_us()
+    sh = max(1, min(8, sh))
+    while time.ticks_diff(time.ticks_us(), t0) < timeout_us:
+        try:
+            top = machine.mem32[base + 0x10] & 0xFFFF
+            ctr = machine.mem32[base + 8] & 0xFFFF
+        except Exception:
+            return
+        if top < 8:
+            top = 65535
+        period = top + 1
+        mid = top >> 1
+        w = max(1, period >> sh)
+        if _pwm_ctr_ring_dist(ctr, mid, period) <= w:
+            return
+
+
+def _wait_ina3221_pwm_off_center(axis_idx: int) -> None:
+    """Align INA sample near the middle of PWM **off** time (DRV8871 IN1 low, quiet RC).
+
+    RP2040 non–phase-correct: MicroPython sets CC so output is high while counter < CC (before CSR invert).
+    Off interval is the complementary part of 0..TOP. ~100% duty (no off) → return immediately.
+    Phase-correct slices fall back to mid-period (single stable window).
+    """
+    if sys.platform != "rp2":
+        return
+    if not int(getattr(config, "INA3221_BUS_V_SYNC_PWM", 1)):
+        return
+    if mon is None or axis_idx < 0 or axis_idx > 2:
+        return
+    sn = _pwm_slice_for_axis[axis_idx]
+    if sn < 0 or sn > 7:
+        return
+    if axis_idx >= len(pwms) or pwms[axis_idx] is None:
+        return
+
+    timeout_us = int(getattr(config, "INA3221_BUS_V_SYNC_TIMEOUT_US", 3000))
+    sh = int(getattr(config, "INA3221_BUS_V_SYNC_OFF_CENTER_SHIFT", 4))
+    sh = max(1, min(8, sh))
+    base = 0x40050000 + sn * 0x14
+
+    try:
+        csr = machine.mem32[base + 0x00]
+    except Exception:
+        return
+
+    if csr & (1 << 3):
+        _pwm_sync_wait_period_mid_slice(sn, timeout_us, sh)
+        return
+
+    try:
+        ch = int(_pwm_cc_chan_per_axis[axis_idx]) & 1
+        cc_word = machine.mem32[base + 0x0C]
+        cc = cc_word & 0xFFFF if ch == 0 else (cc_word >> 16) & 0xFFFF
+        top = machine.mem32[base + 0x10] & 0xFFFF
+    except Exception:
+        return
+
+    if top < 8:
+        top = 65535
+    period = top + 1
+    if period < 2:
+        return
+
+    inv = bool((csr >> (4 + ch)) & 1)
+
+    if not inv:
+        if cc >= period:
+            return
+        if cc == 0:
+            off_len = period
+            target = off_len >> 1
+        else:
+            off_len = period - cc
+            target = cc + (off_len >> 1)
+    else:
+        if cc == 0:
+            return
+        if cc >= period:
+            off_len = period
+            target = off_len >> 1
+        else:
+            off_len = cc
+            target = (cc - 1) >> 1
+
+    w = max(1, off_len >> sh)
+    t0 = time.ticks_us()
+    while time.ticks_diff(time.ticks_us(), t0) < timeout_us:
+        try:
+            ctr = machine.mem32[base + 8] & 0xFFFF
+        except Exception:
+            return
+        if _pwm_ctr_ring_dist(ctr, target, period) <= w:
+            return
 
 
 def _lcd_i2c_bus():
@@ -228,6 +395,10 @@ _last_host_rx_ms = None
 _host_set_ma_ack = False
 _lcd_was_slave_mode = False
 _safe_state = False
+_estop_pin = None
+_estop_button_held = False
+_estop_last_press_ms = None
+_estop_last_release_ms = None
 
 _init_hardware()
 
@@ -274,7 +445,7 @@ def _lcd_seg_ma(actual_ma, limit_ma, target_ma, measured_ok):
 
 
 def _lcd_slave_mode():
-    """Host GUI link active → SLAVED + mA; else READY / DEPLOY (centered)."""
+    """Host GUI link active → SLAVED + mA; else READY FOR / DEPLOYMENT (centered)."""
     now = time.ticks_ms()
     tmo = int(getattr(config, "HOST_LINK_TIMEOUT_MS", 5000))
     return _last_host_rx_ms is not None and time.ticks_diff(now, _last_host_rx_ms) < tmo
@@ -313,13 +484,17 @@ def _lcd_refresh_period_ms():
 
 
 def lcd_refresh(force=False):
-    """Deploy: READY + DEPLOY centered. Slave: SLAVED (centered) + mA (HOST_LINK_TIMEOUT_MS)."""
+    """Idle: READY FOR + DEPLOYMENT centered. Slave: SLAVED (centered) + mA (HOST_LINK_TIMEOUT_MS)."""
     global _last_lcd_ms, _lcd_was_slave_mode, lcd, _lcd_refresh_err_logged
     if lcd is None:
         return
     period = _lcd_refresh_period_ms()
     now = time.ticks_ms()
-    if not force and time.ticks_diff(now, _last_lcd_ms) < period:
+    if (
+        not _estop_button_held
+        and not force
+        and time.ticks_diff(now, _last_lcd_ms) < period
+    ):
         return
     _last_lcd_ms = now
     slave = _lcd_slave_mode()
@@ -328,6 +503,11 @@ def lcd_refresh(force=False):
             lcd.display_on()
         except Exception:
             pass
+        if _estop_button_held:
+            _lcd_put_row(0, _lcd_center_16("SAFE"))
+            _lcd_put_row(1, _lcd_center_16("REBOOTING"))
+            _lcd_was_slave_mode = slave
+            return
         if slave:
             if _safe_state:
                 _lcd_put_row(0, "SAFE STATE")
@@ -337,13 +517,33 @@ def lcd_refresh(force=False):
         else:
             if _lcd_was_slave_mode:
                 _lcd_clear()
-            _lcd_put_row(0, _lcd_center_16("READY"))
-            _lcd_put_row(1, _lcd_center_16("DEPLOY"))
+            _lcd_put_row(0, _lcd_center_16("READY FOR"))
+            _lcd_put_row(1, _lcd_center_16("DEPLOYMENT"))
         _lcd_was_slave_mode = slave
     except Exception as e:
         if not _lcd_refresh_err_logged:
             _lcd_refresh_err_logged = True
             host_print("STATUS LCD refresh ERR:", e)
+
+
+def _show_boot_lcd_splash():
+    """Clear LCD; centered product line + firmware version; hold then continue boot."""
+    if lcd is None:
+        return
+    splash_s = float(getattr(config, "BOOT_LCD_SPLASH_S", 5.0))
+    if splash_s <= 0:
+        return
+    try:
+        try:
+            lcd.display_on()
+        except Exception:
+            pass
+        _lcd_clear()
+        _lcd_put_row(0, _lcd_center_16("3DHC-Calibrator"))
+        _lcd_put_row(1, _lcd_center_16("VER %s" % VERSION))
+        time.sleep(splash_s)
+    except Exception:
+        pass
 
 
 def _pwm_all_off():
@@ -380,6 +580,100 @@ def _coils_hw_all_off_immediate():
         manual_pwm_duty[i] = None
 
 
+def _apply_deploy_ready_coils_off(status_tag=None, refresh_lcd=True):
+    """Same as serial host_disconnect / abort: PWM off, clear SAFE latch, zero setpoints, DEPLOY_READY."""
+    global set_X_ma, set_Y_ma, set_Z_ma, _host_set_ma_ack, _safe_state, _alarm_latched, _last_host_rx_ms
+    set_X_ma = 0.0
+    set_Y_ma = 0.0
+    set_Z_ma = 0.0
+    _host_set_ma_ack = False
+    _safe_state = False
+    _alarm_latched = False
+    _last_host_rx_ms = None
+    _coils_hw_all_off_immediate()
+    msg = "STATUS DEPLOY_READY coils_off pwm_safe"
+    if status_tag:
+        msg += " " + str(status_tag)
+    host_print(msg)
+    if refresh_lcd:
+        _lcd_clear()
+        lcd_refresh(force=True)
+
+
+def _estop_edge_scheduled(_):
+    """Main context: press → deploy-ready + clear LCD + SAFE/REBOOTING; release → normal LCD."""
+    global _estop_button_held, _estop_last_press_ms, _estop_last_release_ms
+    pin = _estop_pin
+    if pin is None:
+        return
+    now = time.ticks_ms()
+    deb = max(40, int(getattr(config, "HARDWARE_ESTOP_DEBOUNCE_MS", 80)))
+    pressed = pin.value() == 0
+
+    if pressed:
+        if _estop_button_held:
+            return
+        if (
+            _estop_last_press_ms is not None
+            and time.ticks_diff(now, _estop_last_press_ms) < deb
+        ):
+            return
+        _estop_last_press_ms = now
+        _estop_button_held = True
+        _apply_deploy_ready_coils_off("hw_estop", refresh_lcd=False)
+        if lcd is not None:
+            try:
+                lcd.display_on()
+            except Exception:
+                pass
+            _lcd_clear()
+            _lcd_put_row(0, _lcd_center_16("SAFE"))
+            _lcd_put_row(1, _lcd_center_16("REBOOTING"))
+    else:
+        if (
+            _estop_last_release_ms is not None
+            and time.ticks_diff(now, _estop_last_release_ms) < deb
+        ):
+            return
+        _estop_last_release_ms = now
+        if not _estop_button_held:
+            return
+        _estop_button_held = False
+        try:
+            lcd_refresh(force=True)
+        except Exception:
+            pass
+
+
+def _estop_pin_irq(_pin):
+    try:
+        micropython.schedule(_estop_edge_scheduled, None)
+    except Exception:
+        pass
+
+
+def _init_hardware_estop():
+    """NO button to GND on HARDWARE_ESTOP_GP: pull-up; press → deploy + SAFE/REBOOTING until release."""
+    global _estop_pin
+    _estop_pin = None
+    gp = int(getattr(config, "HARDWARE_ESTOP_GP", 0))
+    if gp <= 0:
+        return
+    try:
+        _estop_pin = Pin(int(gp), Pin.IN, Pin.PULL_UP)
+        _estop_pin.irq(
+            handler=_estop_pin_irq,
+            trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING,
+        )
+        host_print(
+            "STATUS HARDWARE_ESTOP GP%d pull-up IRQ_FALLING|RISING -> deploy + SAFE while held"
+            % int(gp)
+        )
+    except Exception as e:
+        _estop_pin = None
+        host_print("STATUS HARDWARE_ESTOP init ERR:", e)
+
+
 def _enter_safe(reason):
     """Latched SAFE: PWM off, setpoints zero, refuse set_*_ma until safe_reset or abort."""
     global _safe_state, _alarm_latched, set_X_ma, set_Y_ma, set_Z_ma, _host_set_ma_ack
@@ -408,15 +702,25 @@ def _maybe_coils_hw_all_off_after_setpoints():
 
 
 def _read_currents_raw_ch012():
-    """INA3221 ch0..ch2 mA (raw sign from shunt wiring). Fix polarity at the shunt, not in SW."""
+    """INA3221 ch0..ch2 mA (raw sign from shunt wiring). Fix polarity at the shunt, not in SW.
+
+    With INA3221_BUS_V_SYNC_PWM, each channel is sampled after aligning to that axis's PWM **off**
+    window (middle of IN1 low time) so INA sees the quietest RC node.
+    """
     if mon is None:
         return 0.0, 0.0, 0.0
     try:
-        return (
-            mon.current_ma(0),
-            mon.current_ma(1),
-            mon.current_ma(2),
-        )
+        if not int(getattr(config, "INA3221_BUS_V_SYNC_PWM", 1)):
+            return (
+                mon.current_ma(0),
+                mon.current_ma(1),
+                mon.current_ma(2),
+            )
+        out = [0.0, 0.0, 0.0]
+        for ic in range(3):
+            _wait_ina3221_pwm_off_center(_axis_index_for_ina_ch(ic))
+            out[ic], _ = mon.current_ma_and_bus_voltage_v(ic)
+        return (out[0], out[1], out[2])
     except OSError:
         return 0.0, 0.0, 0.0
 
@@ -432,6 +736,15 @@ def read_currents_ma_ordered_xyz():
     )
 
 
+def _duty_u16_clamped(duty):
+    """0..65535 for MicroPython PWM; if duty>0 but float rounds to 0 counts, use 1 LSB (ramp ease-in)."""
+    duty = max(0.0, min(1.0, float(duty)))
+    u = int(duty * 65535)
+    if duty > 0.0 and u == 0:
+        u = 1
+    return u
+
+
 def set_pwm(axis, duty):
     if axis < 0 or axis >= len(pwms) or pwms[axis] is None:
         return
@@ -444,7 +757,7 @@ def set_pwm(axis, duty):
                 _drv8871_in2_pins[axis].value(0)
             except Exception:
                 pass
-    pwms[axis].duty_u16(int(duty * 65535))
+    pwms[axis].duty_u16(_duty_u16_clamped(duty))
 
 
 def _set_pwm_hz_axis(axis, hz):
@@ -452,7 +765,12 @@ def _set_pwm_hz_axis(axis, hz):
     hz = int(max(100, min(100_000, hz)))
     if 0 <= axis < len(pwms) and pwms[axis] is not None:
         try:
-            pwms[axis].freq(hz)
+            p = pwms[axis]
+            p.freq(hz)
+            # RP2040 MicroPython often resets duty_u16 when freq() changes; restore last command.
+            u = float(_last_u_cmd[axis]) if 0 <= axis < len(_last_u_cmd) else 0.0
+            u = max(0.0, min(1.0, u))
+            p.duty_u16(int(u * 65535))
             return True
         except Exception:
             return False
@@ -637,10 +955,29 @@ def control_step(_=None):
     if time.ticks_diff(now, _last_telem_ms) >= TELEM_PERIOD_MS:
         _last_telem_ms = now
         try:
-            x_i, y_i, z_i = read_currents_ma_ordered_xyz()
-            coil_v_x = mon.bus_voltage_v(order[0]) if mon else float("nan")
-            coil_v_y = mon.bus_voltage_v(order[1]) if mon else float("nan")
-            coil_v_z = mon.bus_voltage_v(order[2]) if mon else float("nan")
+            if mon and int(getattr(config, "INA3221_BUS_V_SYNC_PWM", 1)):
+                r012 = [0.0, 0.0, 0.0]
+                vb = [float("nan"), float("nan"), float("nan")]
+                for ic in range(3):
+                    _wait_ina3221_pwm_off_center(_axis_index_for_ina_ch(ic))
+                    r012[ic], vb[ic] = mon.current_ma_and_bus_voltage_v(ic)
+                c0, c1, c2 = r012[0], r012[1], r012[2]
+                x_i = r012[order[0]]
+                y_i = r012[order[1]]
+                z_i = r012[order[2]]
+                coil_v_x = vb[order[0]]
+                coil_v_y = vb[order[1]]
+                coil_v_z = vb[order[2]]
+            else:
+                c0, c1, c2 = _read_currents_raw_ch012()
+                raw = [c0, c1, c2]
+                x_i, y_i, z_i = raw[order[0]], raw[order[1]], raw[order[2]]
+                if mon:
+                    coil_v_x = mon.bus_voltage_v(order[0])
+                    coil_v_y = mon.bus_voltage_v(order[1])
+                    coil_v_z = mon.bus_voltage_v(order[2])
+                else:
+                    coil_v_x = coil_v_y = coil_v_z = float("nan")
             tmo = int(getattr(config, "HOST_LINK_TIMEOUT_MS", 5000))
             cfg = 0
             if (
@@ -682,9 +1019,15 @@ def control_step(_=None):
                 "diag_Z_duty=%d" % duties.get("Z", 0),
                 "alarm=%d" % (1 if (_alarm_latched or _safe_state) else 0),
             ]
-            print("TM:: " + " ".join(parts))
+            try:
+                micropython.schedule(_scheduled_tm_line, "TM:: " + " ".join(parts))
+            except Exception:
+                pass
         except Exception as e:
-            host_print("STATUS TM_ERR", e)
+            try:
+                micropython.schedule(_scheduled_tm_err, str(e))
+            except Exception:
+                pass
 
     # Do NOT call lcd_refresh() here: this runs from the Timer ISR. I2C/LCD needs heap + main context
     # (see MicroPython ISR rules); doing I2C from the callback can blank the panel or corrupt writes.
@@ -723,17 +1066,7 @@ def handle_line(line):
 
     # host_disconnect = Calibrator host leaving; legacy names kept for old tools.
     if key in ("host_disconnect", "abort", "shutdown", "calibration_stop"):
-        set_X_ma = 0.0
-        set_Y_ma = 0.0
-        set_Z_ma = 0.0
-        _host_set_ma_ack = False
-        _safe_state = False
-        _alarm_latched = False
-        _last_host_rx_ms = None
-        _coils_hw_all_off_immediate()
-        host_print("STATUS DEPLOY_READY coils_off pwm_safe")
-        _lcd_clear()
-        lcd_refresh(force=True)
+        _apply_deploy_ready_coils_off()
         if key == "host_disconnect":
             return "OK host_disconnect"
         return "OK %s" % key
@@ -848,6 +1181,17 @@ def _report_hardware_to_host(boot_footer=True):
     Called once at boot (boot_footer=True). Host can request again with hw_report
     after connect — boot lines are already gone from the serial buffer.
     """
+    global _host_txt_burst_active
+    # Do not deinit the control Timer during hw_report: on some MP builds re-init fails silently
+    # and control_step never runs again (no PWM). Suppressing scheduled TM:: is enough for clean TXT::.
+    _host_txt_burst_active = True
+    try:
+        _report_hardware_to_host_body(boot_footer)
+    finally:
+        _host_txt_burst_active = False
+
+
+def _report_hardware_to_host_body(boot_footer=True):
     host_print("Initializing CoilDriver …")
     host_print("Firmware version", VERSION)
     thz = 1000.0 / max(1, TELEM_PERIOD_MS)
@@ -884,6 +1228,16 @@ def _report_hardware_to_host(boot_footer=True):
                 int(getattr(config, "DC_STABLE_SAMPLES", 12)),
             )
         )
+
+    egp = int(getattr(config, "HARDWARE_ESTOP_GP", 0))
+    edb = int(getattr(config, "HARDWARE_ESTOP_DEBOUNCE_MS", 80))
+    if egp > 0:
+        host_print(
+            "Hardware estop: GP%d (NO to GND), pull-up; press -> DEPLOY + SAFE/REBOOTING LCD until release; debounce %d ms"
+            % (egp, edb)
+        )
+    else:
+        host_print("Hardware estop: off (HARDWARE_ESTOP_GP=0)")
 
     i2c_id = int(getattr(config, "I2C_ID", 0))
     sda = int(getattr(config, "I2C_SDA", 4))
@@ -983,6 +1337,24 @@ def _report_hardware_to_host(boot_footer=True):
             "  IN2 low (GPIO) — X=GP%u Y=GP%u Z=GP%u"
             % (in2[0], in2[1], in2[2])
         )
+        host_print(
+            "  INA PWM off-sync: X slice %u ch %s | Y slice %u ch %s | Z slice %u ch %s"
+            % (
+                _pwm_slice_for_axis[0],
+                "A" if _pwm_cc_chan_per_axis[0] == 0 else "B",
+                _pwm_slice_for_axis[1],
+                "A" if _pwm_cc_chan_per_axis[1] == 0 else "B",
+                _pwm_slice_for_axis[2],
+                "A" if _pwm_cc_chan_per_axis[2] == 0 else "B",
+            )
+        )
+        for i, ax in enumerate(("X", "Y", "Z")):
+            g = int(in1[i])
+            ok = i < len(pwms) and pwms[i] is not None
+            host_print(
+                "  Axis %s IN1 GP%u: hardware PWM %s"
+                % (ax, g, "OK" if ok else "FAIL (no output — bad GPIO or wiring damage)")
+            )
     elif hw == "mosfet_3ch":
         host_print("--- Coil drivers (%s) ---" % hb)
         host_print(
@@ -1015,8 +1387,12 @@ def _report_hardware_to_host(boot_footer=True):
     for i in range(3):
         pwm_ok.append("OK" if i < len(pwms) and pwms[i] is not None else "FAIL")
     host_print(
-        "  PWM slices: X=%s Y=%s Z=%s (duty forced 0 until set_X/Y/Z_ma > 0 — no EN LED then)"
+        "  PWM init summary: X=%s Y=%s Z=%s (0%% duty until setpoint > 0 — driver EN LED may be off)"
         % (pwm_ok[0], pwm_ok[1], pwm_ok[2])
+    )
+    host_print(
+        "  SAFE latched: %s — if yes, PWM stays off until safe_reset / host Reset"
+        % ("YES" if _safe_state else "no")
     )
 
     if boot_footer:
@@ -1046,10 +1422,12 @@ def _lcd_timer_tick(_):
 def main():
     global _BOOT_TICKS_MS
     _init_lcd()
+    _show_boot_lcd_splash()
+    _init_hardware_estop()
     _BOOT_TICKS_MS = time.ticks_ms()
     _pwm_all_off()
     _report_hardware_to_host()
-    # I2CLcd.__init__ already clears; skip extra clear here to avoid double-clear timing before first paint.
+    # After splash: normal idle (READY FOR / DEPLOYMENT) or slave layout.
     lcd_refresh(force=True)
 
     def on_timer(_):
