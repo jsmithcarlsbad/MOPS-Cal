@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """
-Copy MicroPython firmware from ./DEPLOY to a device (e.g. Raspberry Pi Pico W).
+Deploy the MicroPython coil-driver bundle to a Raspberry Pi Pico 2 W.
 
-**Every deploy** (default): copies `Software/Pico` -> `DEPLOY` for the required
-`.py` set, then uploads from `DEPLOY`. That way the folder you deploy is always
-the latest Pico sources from the repo — use `--no-sync-from-pico` only if you
-intentionally hand-edit `DEPLOY/` and want to upload as-is.
+**Single workflow:** pass ``--port`` (e.g. ``COM25``). The script always copies
+the required ``.py`` set from ``Software/Pico`` -> ``DEPLOY``, then runs ``mpremote``
+to copy **only** those same files to the Pico. No separate sync step.
+
+Edit **only** ``Software/Pico/*.py``; that tree is canonical. ``DEPLOY/`` is
+staging updated on every deploy before upload.
 
 Uses mpremote (raw REPL file transfer). Before copying, deploy can send Ctrl+C
 on the serial port so main.py releases the port. Requires pyserial for that step.
 
-**Required modules** (see PICO_FIRMWARE_REQUIRED below) must exist under
-`Software/Pico` (and after sync, under `DEPLOY`) before upload.
+**Required modules** (see ``PICO_FIRMWARE_REQUIRED``) must exist under
+``Software/Pico``.
 
-Requires: pip install mpremote
-Run from repo root or Software/HostApp:
-  python deploy.py --port COM25              # sync Pico -> DEPLOY, then upload
-  python deploy.py --sync-only               # refresh DEPLOY from Software/Pico only
-  python deploy.py --port COM25 --no-sync-from-pico   # upload DEPLOY without syncing
-  python deploy.py --list
-  python deploy.py --version                 # print deploy.py tool version
+Requires: ``pip install mpremote`` (and ``pyserial`` for the Ctrl+C pre-step).
 
-This script's version (not Pico firmware): DEPLOY_SCRIPT_VERSION below.
+Run from repo root or ``Software/HostApp``::
+
+  python deploy.py --port COM25
+
+List serial ports: ``python -m mpremote devs``
+
+This script's version (not Pico firmware): ``DEPLOY_SCRIPT_VERSION`` below.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from pathlib import Path
 
 # deploy.py tool version (this host script only; bump MINOR for behavior or messaging changes).
 DEPLOY_SCRIPT_VERSION_MAJOR = 1
-DEPLOY_SCRIPT_VERSION_MINOR = 0
+DEPLOY_SCRIPT_VERSION_MINOR = 3
 DEPLOY_SCRIPT_VERSION = "%d.%d" % (DEPLOY_SCRIPT_VERSION_MAJOR, DEPLOY_SCRIPT_VERSION_MINOR)
 
 # MicroPython default over USB CDC; host baud is often ignored but pyserial needs a value.
@@ -111,22 +113,7 @@ def _print_deploy_version_banner(deploy: Path, *, after_upload: bool) -> None:
     print(line)
 
 
-def _iter_deploy_py_files(deploy: Path) -> list[Path]:
-    """All non-hidden .py files in DEPLOY (required set must be a subset)."""
-    if not deploy.is_dir():
-        return []
-    out: list[Path] = []
-    for p in sorted(deploy.iterdir()):
-        if (
-            p.is_file()
-            and p.suffix.lower() == ".py"
-            and not p.name.startswith(".")
-        ):
-            out.append(p)
-    return out
-
-
-def cmd_sync_pico_to_deploy(*, show_banner: bool = True) -> int:
+def cmd_sync_pico_to_deploy() -> int:
     """Copy PICO_FIRMWARE_REQUIRED from Software/Pico into DEPLOY."""
     src = _pico_source_dir()
     dst = _deploy_dir()
@@ -147,8 +134,6 @@ def cmd_sync_pico_to_deploy(*, show_banner: bool = True) -> int:
     for name in PICO_FIRMWARE_REQUIRED:
         shutil.copy2(src / name, dst / name)
         print("Synced", name, "->", dst)
-    if show_banner:
-        _print_deploy_version_banner(dst, after_upload=False)
     return 0
 
 
@@ -186,17 +171,12 @@ def _interrupt_serial(port: str, baud: int) -> None:
         print("Warning: Ctrl+C pre-step skipped (port busy or no device):", e, file=sys.stderr)
 
 
-def cmd_list_ports() -> int:
-    r = subprocess.run(_mpremote_base() + ["devs"])
-    return r.returncode
-
-
 def cmd_deploy(port: str, dry_run: bool, interrupt: bool, baud: int) -> int:
     deploy = _deploy_dir()
     missing = _missing_required_firmware(deploy)
     if missing:
         print(
-            "DEPLOY is missing required firmware file(s):",
+            "DEPLOY is missing required firmware file(s) after sync:",
             ", ".join(missing),
             file=sys.stderr,
         )
@@ -206,25 +186,27 @@ def cmd_deploy(port: str, dry_run: bool, interrupt: bool, baud: int) -> int:
             file=sys.stderr,
         )
         print(
-            "Fix: copy from Software/Pico or run: python deploy.py --sync-only",
+            "Fix: ensure each name exists under Software/Pico (sync copies them to DEPLOY).",
             file=sys.stderr,
         )
         return 1
 
-    files = _iter_deploy_py_files(deploy)
-    if not files:
-        print("DEPLOY has no .py files:", deploy, file=sys.stderr)
-        return 1
-
-    deployed_names = {p.name for p in files}
-    extra = sorted(deployed_names - set(PICO_FIRMWARE_REQUIRED))
-    cmd = _mpremote_base() + ["connect", port, "cp"] + [str(f.resolve()) for f in files] + [":"]
-    print("Deploy", len(files), ".py file(s) to", port, "(required set OK)")
+    files = [deploy / name for name in PICO_FIRMWARE_REQUIRED]
+    cmd = (
+        _mpremote_base()
+        + ["connect", port, "cp"]
+        + [str(f.resolve()) for f in files]
+        + [":"]
+    )
+    print(
+        "Deploy",
+        len(files),
+        ".py file(s) to",
+        port,
+        "(Software/Pico required set only)",
+    )
     for f in files:
-        mark = "" if f.name in PICO_FIRMWARE_REQUIRED else " (extra)"
-        print(" ", f.name + mark)
-    if extra:
-        print("Also deploying extra .py:", ", ".join(extra))
+        print(" ", f.name)
     if dry_run:
         if interrupt:
             print("Dry-run: would send Ctrl+C on", port, "then:")
@@ -232,7 +214,7 @@ def cmd_deploy(port: str, dry_run: bool, interrupt: bool, baud: int) -> int:
         return 0
 
     if interrupt:
-        print("Sending Ctrl+C on", port, "(interrupt running app if needed)…")
+        print("Sending Ctrl+C on", port, "(interrupt running app if needed)...")
         _interrupt_serial(port, baud)
 
     r = subprocess.run(cmd)
@@ -254,28 +236,8 @@ def main() -> int:
         "--port",
         "-p",
         metavar="PORT",
-        help="Serial port (Windows: COM3, COM25, …). Required for upload unless --list or --sync-only.",
-    )
-    ap.add_argument(
-        "--list",
-        "-l",
-        action="store_true",
-        help="List serial devices (same as: python -m mpremote devs).",
-    )
-    ap.add_argument(
-        "--sync-from-pico",
-        action="store_true",
-        help="Legacy no-op: syncing Software/Pico -> DEPLOY before upload is now the default.",
-    )
-    ap.add_argument(
-        "--no-sync-from-pico",
-        action="store_true",
-        help="Upload existing DEPLOY/*.py without copying from Software/Pico first.",
-    )
-    ap.add_argument(
-        "--sync-only",
-        action="store_true",
-        help="Only copy Software/Pico -> DEPLOY; do not connect to a device.",
+        required=True,
+        help="Serial port (Windows: COM3, COM25, ...). List devices: python -m mpremote devs",
     )
     ap.add_argument(
         "--dry-run",
@@ -297,25 +259,12 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if args.sync_only:
-        return cmd_sync_pico_to_deploy()
-
-    if args.list:
-        return cmd_list_ports()
-
-    if not args.port:
-        ap.error(
-            "--port is required unless using --list, --sync-only. "
-            "Example: python deploy.py -p COM25"
-        )
-
-    if not args.no_sync_from_pico:
-        r = cmd_sync_pico_to_deploy(show_banner=False)
-        if r != 0:
-            return r
-        ver = _read_coil_driver_version(_deploy_dir() / "coil_driver_app.py")
-        if ver:
-            print(f"(Software/Pico -> DEPLOY done; coil_driver_app version {ver})")
+    r = cmd_sync_pico_to_deploy()
+    if r != 0:
+        return r
+    ver = _read_coil_driver_version(_deploy_dir() / "coil_driver_app.py")
+    if ver:
+        print(f"(Software/Pico -> DEPLOY done; coil_driver_app version {ver})")
 
     return cmd_deploy(
         args.port.strip(),

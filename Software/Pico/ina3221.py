@@ -49,7 +49,10 @@ class INA3221:
             raise ValueError("channel 0..2")
         raw = self._read_s16(_REG_SHUNT[channel])
         v_shunt = raw * _SHUNT_UV_LSB
-        return (v_shunt / self._r) * 1000.0
+        i_ma = (v_shunt / self._r) * 1000.0
+        if i_ma != i_ma:
+            i_ma = 0.0
+        return i_ma
 
     def current_ma_and_bus_voltage_v(self, channel):
         """Read shunt then bus register for one channel back-to-back (mA, V).
@@ -64,6 +67,10 @@ class INA3221:
         v_shunt = raw_s * _SHUNT_UV_LSB
         i_ma = (v_shunt / self._r) * 1000.0
         v_bus = ((raw_b >> 3) & 0x1FFF) * _BUS_V_LSB
+        if i_ma != i_ma:
+            i_ma = 0.0
+        if v_bus != v_bus:
+            v_bus = 0.0
         return i_ma, v_bus
 
     def bus_voltage_v(self, channel):

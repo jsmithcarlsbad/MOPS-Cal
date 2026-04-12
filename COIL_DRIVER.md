@@ -2,13 +2,13 @@
 
 This document is the **reference** for the **3-axis** Helmholtz coil driver: **power**, **switching**, **filtering**, **sensing**, and **return**. It replaces earlier ideas that used the **Waveshare Pico-Motor-Driver** (PCA9685 + TB6612 stack-on board); **that board is not used** in this design.
 
-**MCU:** **Raspberry Pi Pico W** (RP2040 + Wi‑Fi) — referred to as **Pico W** below.
+**MCU:** **Raspberry Pi Pico 2 W** (RP2350 + wireless) — referred to as **Pico 2 W** below.
 
 ---
 
 ## Architecture overview
 
-- **One** **12 V** (nominal) **power brick** feeds the **motor driver board** and shares **GND** with the **Pico W**, **INA3221** logic supply, and the **50 Ω** return network.
+- **One** **12 V** (nominal) **power brick** feeds the **motor driver board** and shares **GND** with the **Pico 2 W**, **INA3221** logic supply, and the **50 Ω** return network.
 - **Three** independent **PWM + direction** channels drive **three** identical **RC low-pass** networks — one per axis (**X / Y / Z**).
 - Each axis: **filtered quasi-DC** → **high-side shunt** (current sense) → **Helmholtz coil pair for that axis** (series wiring as built) → **50 Ω** → **GND**.
 - **Current and bus voltage** for all three axes are read by **one** [**TI INA3221**](https://www.ti.com/lit/ds/symlink/ina3221.pdf) (**three-channel** high-side monitor) over **I2C**, instead of three separate **INA219** modules.
@@ -17,9 +17,9 @@ This document is the **reference** for the **3-axis** Helmholtz coil driver: **p
 
 **Signal flow (repeat for X, Y, Z):**
 
-- **12 V brick** → **Model Y** **VIN**; **brick −**, driver, **Pico W**, **INA3221** logic, and **50 Ω** bottom share **GND**.
+- **12 V brick** → **Model Y** **VIN**; **brick −**, driver, **Pico 2 W**, **INA3221** logic, and **50 Ω** bottom share **GND**.
 - **Model Y** bridge output (that axis) → **RC low-pass** → **shunt** (**INA3221** **IN+** / **IN−**) → **coil** → **50 Ω** → **GND**.
-- **Pico W:** **PWM + direction** GPIO to **Model Y**; **I2C** to **INA3221** for shunt/bus reads.
+- **Pico 2 W:** **PWM + direction** GPIO to **Model Y**; **I2C** to **INA3221** for shunt/bus reads.
 
 ---
 
@@ -35,7 +35,7 @@ This document is the **reference** for the **3-axis** Helmholtz coil driver: **p
 - **Two posts per output (e.g. AK1 and AK2):** same **electrical node** — the board gives duplicate screw terminals for one half-bridge output. For **high-side / unipolar** drive you run **one wire per axis** from **either** post to your RC → coil → return; you do **not** need two separate connections for X (same for Y, Z).
 - **Fourth** channel is spare (redundancy or future use).
 
-**Not in this design:** [**Waveshare Pico-Motor-Driver**](https://www.waveshare.com/wiki/Pico-Motor-Driver) (stack-on **PCA9685** + **TB6612**) — avoids **I2C PWM** complexity and **address** clashes with the current monitor; **GPIO PWM** on the Pico drives the Model Y directly.
+**Not in this design:** [**Waveshare Pico-Motor-Driver**](https://www.waveshare.com/wiki/Pico-Motor-Driver) (stack-on **PCA9685** + **TB6612**) — avoids **I2C PWM** complexity and **address** clashes with the current monitor; **GPIO PWM** on the **Pico 2 W** drives the Model Y directly.
 
 ---
 
@@ -69,7 +69,7 @@ Replace module **default** shunts with your **2512** parts only if the stock val
 **Single** **INA3221** breakout (**three** channels) replaces **three** **INA219** boards.
 
 - **Interface:** **I2C** (SMBus-compatible); **four** selectable addresses via **A0** (see datasheet).
-- **Pico** connects **SDA / SCL** and **3.3 V** logic **GND** common with the monitor **VS** (2.7–5.5 V).
+- **Pico 2 W** connects **SDA / SCL** and **3.3 V** logic **GND** common with the monitor **VS** (2.7–5.5 V).
 - **Firmware** uses the **INA3221** register map — **not** INA219 registers.
 
 ---
@@ -90,11 +90,11 @@ Replace module **default** shunts with your **2512** parts only if the stock val
 ### Software
 
 - **Drivers:** **I2C** driver for **INA3221** (init **Configuration**, **shunt/bus** read registers, **channel** indexing **1–3** mapped to **X–Z**). Optional use of **programmable conversion time** and **averaging** (datasheet) to match **loop rate** and **noise**.
-- **Actuation:** **RP2040 PWM** (**~5 kHz** per `config.py`, with **~83 Hz** RC) on **GPIO** tied to Model Y **ENA/ENB** for the three chosen channels; **GPIO** outputs for **INx** **direction** bits, held **fixed** for **unipolar** drive during normal operation.
+- **Actuation:** **RP2350 PWM** (**~5 kHz** per `config.py`, with **~83 Hz** RC) on **GPIO** tied to Model Y **ENA/ENB** for the three chosen channels; **GPIO** outputs for **INx** **direction** bits, held **fixed** for **unipolar** drive during normal operation.
 - **Control law:** **PI** or **PID** per axis is sufficient to start; **anti-windup** if **duty** saturates; **independent** loops for **X**, **Y**, **Z** (minimal **cross-coupling** if **GND** and **12 V** are solid).
 - **Calibration:** **Scale** shunt readings with measured **`R_shunt`** (including **0.1 Ω** tolerance). Optionally store **offset** per channel (board **offset** + **ADC** zero).
 - **Setpoint source:** **Phase 1:** constants or **pot** / debug. **Phase 2:** **USB serial** (or Wi‑Fi) **target mA** per axis from the **PC** app — align with **`DriverAndControlApp/`** deployment docs when implemented.
-- **Scheduling:** **Fixed** loop interval or **async** I2C with **rate limiting**; ensure **PWM** updates do not **starve** **I2C** (or vice versa) on RP2040.
+- **Scheduling:** **Fixed** loop interval or **async** I2C with **rate limiting**; ensure **PWM** updates do not **starve** **I2C** (or vice versa) on RP2350.
 
 ---
 
@@ -108,7 +108,10 @@ Replace module **default** shunts with your **2512** parts only if the stock val
 ## Related files
 
 - **`Software/Pico/`** — MicroPython firmware: **`main.py`** (runs on boot), **`coil_driver_app.py`**, **`ina3221.py`**, **`config.py`**. **I2C0** **GP4/GP5** = **INA3221** only; **I2C1** **GP2/GP3** = **Freenove 2×16 LCD** (see **`Hardware/Freenove_LCD_Module/`**, **`config.LCD_I2C_*`**).
-- **`ELECTRONICS.md`** — naming (**Pico W**), legacy pointers, **Helmholtz** field goal.
-- **`3D_WIRING.md`** — calibrator ↔ 3D fixture **6-pin** harness (pin numbers + wire colors).
-- **`DEPLOY/`** — MicroPython files to copy to the Pico.
+- **`ELECTRONICS.md`** — naming (**Pico 2 W**), legacy pointers, **Helmholtz** field goal.
+- **`3D_WIRING.md`** — calibrator / **driver chassis** ↔ 3D fixture **6-pin** harness (pin numbers, wire colors, **X/Y/Z Coil±** signals).
+- **`Hardware/BENCH_TEST_3DHC.md`** — **lab-supply-only** bench procedure for the **3D Helmholtz** fixture + CSV logger (**`Software/Tools/xdm1041/bench_3dhc_log.py`**).
+- **`DEPLOY/`** — MicroPython files to copy to the **Pico 2 W**.
 - **`HelmholtzX/Y/Z.scad`** — coil geometry and **resistance** stats.
+- **`Hardware/sim/`** — NGSpice smoke netlist **`rc_smoke.cir`** and **`run_spice.ps1`** / **`run_spice.bat`** (see **`Hardware/sim/README.md`**).
+- **`Software/Tools/xdm1041/`** — headless **OWON XDM1041** SCPI client (extracted from [XDM1041-GUI](https://github.com/jsmithcarlsbad/XDM1041-GUI); see **`README.md`** there for the full Qt app and **`REMOTE_PROTOCOL.md`** for Pico↔GUI bridge).

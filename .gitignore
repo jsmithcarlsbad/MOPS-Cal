@@ -9,3 +9,9 @@ Thumbs.db
 .venv/
 venv/
 env/
+
+# NGSpice batch output (see Hardware/sim/run_spice.ps1)
+Hardware/sim/rc_smoke_out.txt
+
+# Local clone for comparing upstream XDM1041-GUI (never commit)
+Software/Tools/_xdm1041_upstream/

@@ -1,10 +1,10 @@
 # Driver electronics — naming & hardware
 
-**3D Helmholtz coil driver (agreed hardware + control):** see **`COIL_DRIVER.md`** — **OSOYOO Model Y** + **Pico W** + **RC** + **INA3221** + **50 Ω** return; **not** the Waveshare Pico-Motor-Driver.
+**3D Helmholtz coil driver (agreed hardware + control):** see **`COIL_DRIVER.md`** — **OSOYOO Model Y** + **Pico 2 W** + **RC** + **INA3221** + **50 Ω** return; **not** the Waveshare Pico-Motor-Driver.
 
 For the remainder of this project:
 
-- **pico** — means **Raspberry Pi Pico W** (RP2040 + CYW43439 Wi‑Fi). **Not** Raspberry Pi Pico 2 W.
+- **pico** — means **Raspberry Pi Pico 2 W** (RP2350 + wireless). **Not** the original **Pico W** (RP2040) unless a note explicitly says legacy.
 
 - **Motor driver (3D build)** — [**OSOYOO Model Y**](https://osoyoo.com/2022/02/25/osoyoo-model-y-4-channel-motor-driver/) (see **`COIL_DRIVER.md`**). The [**Waveshare Pico-Motor-Driver**](https://www.waveshare.com/wiki/Pico-Motor-Driver) is **not** used (no PCA9685 stack-on).
 
@@ -30,6 +30,6 @@ Firmware and harness docs live in this repo: **`DEPLOY/`**, **`3D_WIRING.md`**, 
 
 ## Driver documentation and variants
 
-- **Documented 3D driver:** **`COIL_DRIVER.md`** — **Model Y** (3 of 4 channels), **INA3221**, **RC**, **50 Ω** return, **Pico W** closed loop.
+- **Documented 3D driver:** **`COIL_DRIVER.md`** — **Model Y** (3 of 4 channels), **INA3221**, **RC**, **50 Ω** return, **Pico 2 W** closed loop.
 
 - **Optional future:** **Three discrete MOSFET** legs instead of Model Y — same **RC + INA3221 + 50 Ω** **topology** per axis if you later want a custom power stage.
