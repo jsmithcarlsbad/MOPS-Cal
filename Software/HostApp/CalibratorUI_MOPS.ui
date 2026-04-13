@@ -667,6 +667,19 @@
       <string>Test Setp 2</string>
      </property>
     </widget>
+    <widget class="QCheckBox" name="checkBox_TestNull">
+     <property name="geometry">
+      <rect>
+       <x>620</x>
+       <y>170</y>
+       <width>84</width>
+       <height>24</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Test NULL</string>
+     </property>
+    </widget>
    </widget>
    <widget class="QGroupBox" name="groupBox_9">
     <property name="geometry">

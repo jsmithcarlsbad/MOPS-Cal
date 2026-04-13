@@ -21,7 +21,8 @@ Serial line protocol (newline-terminated):
   TM:: key=value ... — telemetry: LEDs (alarm, cfg, closed_loop, meas_ok); measured mA and coil V
     (Host: TM lines that lost the leading prefix may be repaired if they start with '=float set_Y_v=' — restores set_X_v.)
     LCDs (lcdNumber_[XYZ]_mA from X_ma/Y_ma/Z_ma, with diag_Ch*_ma + ina_*_ch fallback if *_ma is nan;
-    lcdNumber_[XYZ]_Volts from coil_V_X/Y/Z). Unprefixed TM-shaped rows use the same parser and are not copied
+    lcdNumber_[XYZ]_Volts from coil_V_X/Y/Z; digit color vs set_*_v when |set| < ~12 V (otherwise 12 V bus bands).
+    Unprefixed TM-shaped rows use the same parser and are not copied
     to the text log.
   On connect: by default the host does not reset the Pico — it clears DTR/RTS after opening the COM port (Windows often toggles them and resets RP2040), then waits briefly for boot / CDC.
     If soft reset on connect is off, boot TXT:: was usually already sent before the port opened; the host then sends hw_report so the text log fills with the Pico hardware summary (same as firmware boot report).
@@ -399,6 +400,22 @@ def load_ini() -> configparser.ConfigParser:
                 save_ini(cp)
             except OSError:
                 pass
+    if not cp.has_section("null_servo"):
+        cp.add_section("null_servo")
+    for _nk, _nv in (
+        ("target_gauss", "0.57"),
+        ("v_abs_max", "12.0"),
+        ("v_step_max", "0.1"),
+        ("period_ms", "200"),
+        ("Kp", "0.12"),
+        ("Ki", "0.02"),
+        ("integrator_abs_max", "4.0"),
+        ("sign_x", "1"),
+        ("sign_y", "1"),
+        ("sign_z", "1"),
+    ):
+        if not cp.has_option("null_servo", _nk):
+            cp.set("null_servo", _nk, _nv)
     return cp
 
 
@@ -480,6 +497,13 @@ def _volts_lcd_digit_color(v: float) -> str:
     if v > _COIL_V_GREEN_HI:
         return _MEAS_LCD_AMBER
     return _MEAS_LCD_GREEN
+
+
+def _coil_volts_lcd_color(meas_v: float, set_v: float | None) -> str:
+    """INA coil bus V on LCD: low commanded V → color vs set_*_v; else 12 V rail banding."""
+    if set_v is not None and math.isfinite(set_v) and abs(set_v) < _COIL_V_LOW_RED:
+        return _test_volt_lcd_digit_color(meas_v, set_v, tol=_TEST_VOLT_TOL_V)
+    return _volts_lcd_digit_color(meas_v)
 
 
 def _test_volt_lcd_digit_color(meas: float, target: float, tol: float = _TEST_VOLT_TOL_V) -> str:
@@ -624,6 +648,25 @@ class CalibratorController:
         self._mag_test_ws: object | None = None
         self._mag_test_xlsx_row_count = 0
         self._mag_test_xlsx_missing_logged = False
+
+        self._null_servo_chk: QCheckBox | None = win.findChild(
+            QCheckBox, "checkBox_TestNull"
+        )
+        self._null_servo_active = False
+        self._null_servo_prev_override_checked = False
+        self._null_servo_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        self._null_servo_timer = QTimer(self._win)
+        self._null_servo_timer.timeout.connect(self._null_servo_tick)
+        self._null_servo_target_gauss = 0.57
+        self._null_servo_v_abs_max = 12.0
+        self._null_servo_v_step_max = 0.1
+        self._null_servo_period_ms = 200
+        self._null_servo_kp = 0.12
+        self._null_servo_ki = 0.02
+        self._null_servo_i_abs_max = 4.0
+        self._null_servo_sign = {"X": 1, "Y": 1, "Z": 1}
+        self._reload_null_servo_params()
 
         self._combo_port = win.findChild(QComboBox, "comboBox_CalibratorPort")
         self._combo_baud = win.findChild(QComboBox, "comboBox_CalbratorBaud")
@@ -884,6 +927,12 @@ class CalibratorController:
             self._master_coils_enable.stateChanged.connect(
                 self._on_master_coils_enable_changed
             )
+        if self._null_servo_chk is not None:
+            self._null_servo_chk.setToolTip(
+                "Test NULL: closed-loop coil set_V toward [null_servo] target_gauss on each MT-102 "
+                "Gauss axis (F-cal required). Supersedes voltage override UI; SAFE when unchecked."
+            )
+            self._null_servo_chk.stateChanged.connect(self._on_test_null_changed)
         for ax, _sp, pb, _lcd, chk in self._axis_rows:
             if pb is not None:
                 pb.clicked.connect(lambda checked=False, a=ax: self._on_set_axis_ma(a))
@@ -1188,6 +1237,7 @@ class CalibratorController:
         self._sync_soft_reset_menu_from_ini()
         self._reload_helmholtz_geometry()
         self._reload_mt102_ini_preferences()
+        self._reload_null_servo_params()
         self._set_status("Settings restored from CalibratorUI.ini.")
         self._dbg(1, "settings restore; DEBUG level now", self._debug_level)
 
@@ -1925,7 +1975,8 @@ class CalibratorController:
                     lcd, f"{v:.2f}", neutral_style, self._lcd_volts_cache
                 )
                 continue
-            c = _volts_lcd_digit_color(v)
+            set_v = self._tm_float(kv, f"set_{ax}_v")
+            c = _coil_volts_lcd_color(v, set_v)
             self._lcd_set_if_changed(
                 lcd,
                 f"{v:.2f}",
@@ -2152,8 +2203,224 @@ class CalibratorController:
         except Exception as e:
             self._set_status(f"{axis} set_*_v write failed: {e}")
 
+    def _on_test_null_changed(self, _state: int = 0) -> None:
+        if self._null_servo_chk is None:
+            return
+        if self._null_servo_chk.isChecked():
+            self._null_servo_start()
+        else:
+            self._null_servo_stop(send_safe=True)
+
+    def _null_servo_start(self) -> None:
+        """Arm Test NULL: F-cal Gauss → three SISO PI loops on set_*_v (see [null_servo])."""
+        if self._null_servo_chk is None:
+            return
+        if self._serial is None:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: connect Pico serial first.")
+            return
+        if MT102Interface is None or self._mt102 is None:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: connect MT-102 (Connect all) first.")
+            return
+        try:
+            if not self._mt102.is_connected():
+                raise RuntimeError("MT-102 not connected")
+        except Exception:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: MT-102 not connected.")
+            return
+        cal = None
+        try:
+            if hasattr(self._mt102, "get_cal_data"):
+                cal = self._mt102.get_cal_data()
+        except Exception:
+            cal = None
+        if cal is None:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: wait for MT-102 factory F-cal (Gauss) before enabling.")
+            return
+        if len(self._volt_override_spins) != 3:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: need Test V spinboxes (doubleSpinBox_Test_X/Y/Z_V).")
+            return
+        if self._master_coils_enable is None:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: need checkBox_TestVoltageSetting (master coil enable).")
+            return
+
+        self._reload_null_servo_params()
+        mag = None
+        try:
+            mag = self._mt102.get_mag_data(timeout=0.05)
+        except Exception:
+            mag = None
+        if mag is None:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: no MT-102 sample yet — try again.")
+            return
+        try:
+            gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
+        except Exception:
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: Gauss conversion failed.")
+            return
+        if not all(math.isfinite(v) for v in (gx, gy, gz)):
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+            self._set_status("Test NULL: MT-102 Gauss not finite (F-cal required).")
+            return
+
+        self._null_servo_prev_override_checked = bool(
+            self._volt_override_chk is not None and self._volt_override_chk.isChecked()
+        )
+        if self._volt_override_chk is not None:
+            self._volt_override_chk.blockSignals(True)
+            self._volt_override_chk.setChecked(True)
+            self._volt_override_chk.blockSignals(False)
+            self._volt_override_chk.setEnabled(False)
+        self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        for ax in ("X", "Y", "Z"):
+            self._null_servo_v[ax] = 0.0
+            self._send_axis_set_v(ax, 0.0)
+            sp = self._volt_override_spins.get(ax)
+            if sp is not None:
+                sp.blockSignals(True)
+                sp.setValue(0.0)
+                sp.setEnabled(False)
+                sp.blockSignals(False)
+
+        self._master_coils_enable.blockSignals(True)
+        self._master_coils_enable.setChecked(True)
+        self._master_coils_enable.blockSignals(False)
+        self._master_coils_enable.setEnabled(False)
+        self._on_master_coils_enable_changed(0)
+
+        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
+            if chk is not None:
+                chk.setEnabled(False)
+
+        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        self._null_servo_active = True
+        self._null_servo_timer.start()
+        self._dbg(1, "Test NULL: started; target_gauss=", self._null_servo_target_gauss)
+        self._set_status(
+            "Test NULL: servo running toward %.3f G on each axis (INI [null_servo])."
+            % (self._null_servo_target_gauss,)
+        )
+
+    def _null_servo_stop(self, send_safe: bool = True) -> None:
+        """Exit Test NULL: re-enable widgets; optional SAFE (coils off)."""
+        self._null_servo_timer.stop()
+        was_active = self._null_servo_active
+        self._null_servo_active = False
+        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+
+        if self._volt_override_spins:
+            for sp in self._volt_override_spins.values():
+                sp.setEnabled(True)
+        if self._volt_override_chk is not None:
+            self._volt_override_chk.setEnabled(True)
+            self._volt_override_chk.blockSignals(True)
+            self._volt_override_chk.setChecked(self._null_servo_prev_override_checked)
+            self._volt_override_chk.blockSignals(False)
+        if self._master_coils_enable is not None:
+            self._master_coils_enable.setEnabled(True)
+        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
+            if chk is not None:
+                chk.setEnabled(True)
+
+        if self._null_servo_chk is not None and self._null_servo_chk.isChecked():
+            self._null_servo_chk.blockSignals(True)
+            self._null_servo_chk.setChecked(False)
+            self._null_servo_chk.blockSignals(False)
+
+        if send_safe and was_active and self._serial is not None:
+            try:
+                self._dbg(1, "Test NULL: stop → SAFE")
+                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
+                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+                self._serial.write(b"safe\r\n")
+                self._serial.flush()
+                self._set_status("Test NULL off — SAFE sent (coils off).")
+            except Exception as e:
+                self._set_status(f"Test NULL stop: SAFE failed: {e}")
+        elif was_active:
+            self._set_status("Test NULL off.")
+
+    def _null_servo_tick(self) -> None:
+        if not self._null_servo_active:
+            return
+        if self._serial is None or MT102Interface is None or self._mt102 is None:
+            self._null_servo_stop(send_safe=False)
+            return
+        cal = None
+        try:
+            if hasattr(self._mt102, "get_cal_data"):
+                cal = self._mt102.get_cal_data()
+        except Exception:
+            cal = None
+        if cal is None:
+            return
+        try:
+            mag = self._mt102.get_mag_data(timeout=0)
+        except Exception:
+            return
+        if mag is None:
+            return
+        try:
+            gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
+        except Exception:
+            return
+        if not all(math.isfinite(v) for v in (gx, gy, gz)):
+            return
+
+        g_tgt = float(self._null_servo_target_gauss)
+        gvec = {"X": float(gx), "Y": float(gy), "Z": float(gz)}
+        dt = max(1e-3, self._null_servo_period_ms / 1000.0)
+        for ax in ("X", "Y", "Z"):
+            e = (g_tgt - gvec[ax]) * float(self._null_servo_sign[ax])
+            self._null_servo_i[ax] += e * dt
+            lim = self._null_servo_i_abs_max
+            self._null_servo_i[ax] = max(-lim, min(lim, self._null_servo_i[ax]))
+            du = self._null_servo_kp * e + self._null_servo_ki * self._null_servo_i[ax]
+            v = self._null_servo_v[ax] + du
+            v = max(0.0, min(self._null_servo_v_abs_max, v))
+            dv = v - self._null_servo_v[ax]
+            sm = self._null_servo_v_step_max
+            if abs(dv) > sm:
+                v = self._null_servo_v[ax] + math.copysign(sm, dv)
+            v = max(0.0, min(self._null_servo_v_abs_max, v))
+            self._null_servo_v[ax] = v
+            self._volt_ov_cmd_v[ax] = v
+            self._send_axis_set_v(ax, v)
+            sp = self._volt_override_spins.get(ax)
+            if sp is not None:
+                sp.blockSignals(True)
+                sp.setValue(v)
+                sp.blockSignals(False)
+
     def _volt_override_pwm_adjust(self, kv: dict[str, str]) -> None:
         """Nudge set_<axis>_v using TM:: coil_V_* vs doubleSpinBox_Test_*_V (Pico 5.x voltage mode)."""
+        if self._null_servo_active:
+            return
         if self._volt_override_chk is None or not self._volt_override_chk.isChecked():
             return
         if self._serial is None:
@@ -2248,6 +2515,10 @@ class CalibratorController:
         if self._serial is None:
             self._set_status("Not connected.")
             return
+        if self._null_servo_active or (
+            self._null_servo_chk is not None and self._null_servo_chk.isChecked()
+        ):
+            self._null_servo_stop(send_safe=False)
         try:
             self._dbg(1, "action: SAFE (safe)")
             if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
@@ -2667,6 +2938,37 @@ class CalibratorController:
                 )
             except ValueError:
                 self._mag_declination_deg = 0.0
+
+    def _reload_null_servo_params(self) -> None:
+        """[null_servo] from CalibratorUI.ini — see load_ini defaults."""
+        ini = self._ini
+        sec = "null_servo"
+        if not ini.has_section(sec):
+            return
+
+        def _fopt(key: str, default: float) -> float:
+            try:
+                return float(ini.get(sec, key, fallback=str(default)).strip())
+            except ValueError:
+                return default
+
+        def _iopt(key: str, default: int) -> int:
+            try:
+                return int(round(float(ini.get(sec, key, fallback=str(default)).strip())))
+            except ValueError:
+                return default
+
+        self._null_servo_target_gauss = _fopt("target_gauss", 0.57)
+        self._null_servo_v_abs_max = max(0.1, _fopt("v_abs_max", 12.0))
+        self._null_servo_v_step_max = max(1e-6, _fopt("v_step_max", 0.1))
+        self._null_servo_period_ms = max(20, _iopt("period_ms", 200))
+        self._null_servo_kp = _fopt("Kp", 0.12)
+        self._null_servo_ki = _fopt("Ki", 0.02)
+        self._null_servo_i_abs_max = max(0.01, _fopt("integrator_abs_max", 4.0))
+        for ax in ("X", "Y", "Z"):
+            s = _iopt(f"sign_{ax.lower()}", 1)
+            self._null_servo_sign[ax] = -1 if s < 0 else 1
+        self._null_servo_timer.setInterval(self._null_servo_period_ms)
 
     def _on_mt102_thread_error(self, msg: str) -> None:
         self._set_status("MT-102: %s" % (msg,))
@@ -3524,6 +3826,7 @@ class CalibratorController:
 
     def _disconnect(self) -> None:
         self._dbg(1, "disconnect: stopping timers and closing serial")
+        self._null_servo_stop(send_safe=False)
         self._disconnect_mt102_only()
         self._connect_rx_pump_slices = 0
         self._connect_mono_ts = None
