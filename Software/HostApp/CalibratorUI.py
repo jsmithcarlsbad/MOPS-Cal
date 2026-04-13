@@ -2,7 +2,19 @@
 """
 CalibratorUI — PySide6 host for the CoilDriver Pico (serial).
 
-Loads CalibratorUI.ui from this directory. Settings in CalibratorUI.ini (UTF-8).
+Loads CalibratorUI_MOPS.ui from this directory. Settings in CalibratorUI.ini (UTF-8).
+
+  [serial]: Pico `pico_port` + `baud` (legacy `port` is written with the same value on save); MT-102
+  `rs422_port`, `rs232_port`, `baud_rate`.
+  **Site Calibration** only (not under Settings): top-level ``menuSite_Calibration`` from Designer gets
+  ``MT-102 Gauss scale...`` and ``Align MT-102 scale to reference meter...`` (programmatic ``QAction``s).
+  ``objectName`` may be on the menubar ``QAction`` or the ``QMenu`` — both are resolved.
+  Connect all (`pushButton_ConnectAll`): opens Pico serial first, then MT-102 from ini (dual COM + threaded reader);
+  disconnect closes MT-102 first, then Pico (host_disconnect). 3D view embeds after `show()` (PyVista/Qt).
+  Optional ``radioButton_F_CalApplied`` (Designer): LED-style — **gray** only when MT-102 is not connected;
+  **bright red** when connected but F-cal not loaded yet; **lime** when flash F-cal is present (``get_cal_data()``).
+  Optional MT-102 field Gauss LCDs (Designer): ``lcdNumber_Mt102_X_Gauss`` and/or ``lcdNumber_MT102_{X,Y,Z}_Gauss``
+  (capital ``G``) or ``lcdNumber_MT102_*_gauss`` — host tries every spelling so one typo axis does not stay at 0.
 
 Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
@@ -16,7 +28,7 @@ Serial line protocol (newline-terminated):
     Firmware prints TXT:: OK VERSION … and a hardware report at boot, then streams TM:: every control loop (~LOOP_Hz) with X/Y/Z always present; no host keepalive.
     Optional Settings → "Soft reset on connect" (CalibratorUI.ini [serial] soft_reset_on_connect=1): Ctrl+C then Ctrl+D (MicroPython soft reset),
     then a short boot wait — use only when stuck in >>> REPL.
-  Link “fresh” on any TXT:: or TM:: line. Stale: no traffic for ~8 s before the first line after connect, or >3 s after traffic stops (yellow LED + status; STALE dbg at DEBUG≥1 once per episode).
+  Link “fresh” on any TXT:: or TM:: line. Stale: no traffic for ~8 s before the first line after connect, or >3 s after traffic stops (yellow LED + status; STALE dbg at DEBUG==1 once per episode).
   On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready; legacy abort still on Pico).
   Status bar Reset sends `safe_reset`: Pico turns off all bridge PWM (IN1 duty 0, inactive) like `safe`. SAFE sends `safe` (same coil-off path; not latched). Soft reset on connect (Ctrl+C Ctrl+D) restarts firmware; boot forces PWM outputs off until host commands again.
   Settings (menu, saved in CalibratorUI.ini [settings]): PWM 3/5 kHz (host display / legacy; Pico 5.x fixes Hz in firmware).
@@ -39,13 +51,14 @@ Serial line protocol (newline-terminated):
   spinbox using TM:: coil_V_*; test LCDs use green within ±0.25 V, amber below that band, red above.
 
   Debug (terminal stdout): CalibratorUI.ini [debug] DEBUG = integer 0–9 (default 0).
-    One line always goes to stderr with ini path and effective level (even when DEBUG=0).
-    0 = off. 1 = basic (connect/disconnect, serial backlog cap, log trim, Pico version).
-    2 = + TXT:: / unprefixed serial lines (truncated); once per serial link, one TM dbg line: if set_X_v/set_x_v
-    is absent but X_ma or coil_V_X is present, log that raw TM (truncated); else log the first TM line after connect.
-    3 = + TM:: rows to HostApp/test_1.csv (set_*_v, *_ma, coil_V_*, meas_ok, Gauss_X/Y/Z from [helmholtz] + mA) and
-    a compact DBG3 TM_CSV line per TM
-    (also non-TM RX repr as before).
+    ``_dbg(N, ...)`` prints **only** when ``DEBUG == N`` and ``N > 0`` (exact level; no cumulative lower levels).
+    One stderr line always shows ini path and effective DEBUG (even when DEBUG=0). Feature gates (TM CSV file,
+    etc.) still use DEBUG thresholds documented below.
+    0 = no DBG stdout. 1 = connect/disconnect, actions, serial cap trim, Pico version, widget warnings.
+    2 = Set TX echo on voltage-override sends. 3 = MT102 connect / F-cal / skip-fail lines only.
+    4 = TM CSV + TM/serial chunk trace (``serial read``, ``RX (unprefixed)``, ``TM_CSV``, ``TXT``, TM-diag).
+    5 = MT102: ``MagTest.xlsx`` (timestamp, coil V, RAW; Gauss columns only after factory
+    F-cal loads). No DBG5 MT102 stdout stream. Requires ``openpyxl``.
 
   Run:
     pip install -r requirements.txt
@@ -71,7 +84,7 @@ from pathlib import Path
 
 import serial
 import serial.tools.list_ports
-from PySide6.QtCore import QFile, QIODevice, Qt, QTimer
+from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap, QTextCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
@@ -89,17 +102,38 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QMainWindow,
+    QMenu,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
+
+try:
+    from mt102_interface import MT102Interface
+except ImportError:
+    MT102Interface = None  # type: ignore[misc, assignment]
+
+try:
+    from viewer3d import Viewer3D
+except ImportError:
+    Viewer3D = None  # type: ignore[misc, assignment]
+
+try:
+    from openpyxl import Workbook as _OpenpyxlWorkbook
+except ImportError:
+    _OpenpyxlWorkbook = None  # type: ignore[misc, assignment]
 
 # --- Paths ---
 _HERE = Path(__file__).resolve().parent
-_UI_PATH = _HERE / "CalibratorUI.ui"
+_UI_PATH = _HERE / "CalibratorUI_MOPS.ui"
 _INI_PATH = _HERE / "CalibratorUI.ini"
-# DEBUG≥3: append TM snapshot rows here (CSV for Excel/plot tools; not .xls binary).
+# DEBUG≥4: append TM snapshot rows here (CSV for Excel/plot tools; not .xls binary).
+_TM_CSV_DEBUG_MIN = 4
+_MT102_TRACE_DEBUG_MIN = 5
 _TM_CSV_PATH = _HERE / "test_1.csv"
+_MAG_TEST_XLSX_PATH = _HERE / "MagTest.xlsx"
+_MAG_TEST_XLSX_SAVE_EVERY_N = 25
 # Project logo for Help → About (user asset); also accepts HostApp/3DHC_Logo.png as fallback.
 _HOST_ASSETS_DIR = _HERE.parent / "Host"
 _ABOUT_LOGO_NAME = "3DHC_Logo.png"
@@ -114,7 +148,7 @@ _MAX_CURRENT_MA_CHOICES = (20.0, 50.0, 80.0, 100.0, PICO_MAX_COIL_MA)
 # bump MAJOR only for incompatible protocol/UI changes. Git commit messages should cite this and
 # coil_driver_app.py VERSION as a tested pair.
 CALIBRATOR_UI_VERSION_MAJOR = 1
-CALIBRATOR_UI_VERSION_MINOR = 28
+CALIBRATOR_UI_VERSION_MINOR = 30
 CALIBRATOR_UI_VERSION = "%d.%d" % (CALIBRATOR_UI_VERSION_MAJOR, CALIBRATOR_UI_VERSION_MINOR)
 
 _HELP_ABOUT_TITLE = "About Calibrator"
@@ -165,6 +199,25 @@ _HELMHOLTZ_PAIR_AXIS_CENTER_FACTOR = 8.0 / (5.0 ** 1.5)
 _NULL_INDICATOR_I_MIN_ABS_MA = 2.0
 _NULL_INDICATOR_B_UNIFORM_FRAC = 0.01
 
+# MT-102 (mag) — UI + data monitor (see CalibratorUI.ini [serial] mt102_* and [mt102_limits] / [mt102_display])
+# Gauss = (MagnetometerParser F-corrected Int16 count) × this factor. Old 0.01 matched an
+# erroneous extra scale in host code; tune against a traceable Gaussmeter (see mt102_interface).
+MAG_RAW_TO_GAUSS = 1e-5
+MT102_RAW_GREEN = 2500
+MT102_RAW_AMBER = 4000
+MT102_GAUSS_GREEN = 0.6
+MT102_GAUSS_AMBER = 1.0
+MT102_DATA_MONITOR_MAX_LINES = 500
+MT102_LCD_BG = "black"
+MT102_AMBER = "#FFBF00"
+_DEFAULT_MT102_BAUD = 9600
+
+
+class _Mt102ErrBridge(QObject):
+    """Thread-safe: worker calls err.emit(msg); UI slot runs on the Qt GUI thread."""
+
+    err = Signal(str)
+
 
 def _helmholtz_pair_axis_center_gauss(
     i_a: float, radius_m: float, n_turns: float
@@ -201,6 +254,8 @@ _LED_COLORS = {
     "yellow": "#fbc02d",
     "amber": "#ffb300",
     "gray": "#757575",
+    "lime": "#39ff14",
+    "red_bright": "#ff1744",
 }
 
 
@@ -279,6 +334,9 @@ def load_ini() -> configparser.ConfigParser:
         cp.add_section("serial")
     if not cp.has_option("serial", "port"):
         cp.set("serial", "port", "")
+    if not cp.has_option("serial", "pico_port"):
+        # Match rs422_port / rs232_port naming; legacy key `port` is kept in sync on save.
+        cp.set("serial", "pico_port", cp.get("serial", "port", fallback="").strip())
     if not cp.has_option("serial", "baud"):
         cp.set("serial", "baud", "115200")
     if not cp.has_option("serial", "soft_reset_on_connect"):
@@ -305,6 +363,42 @@ def load_ini() -> configparser.ConfigParser:
             cp.set("helmholtz", f"{_ax}_turns", "0")
         if not cp.has_option("helmholtz", f"{_ax}_r_ohm"):
             cp.set("helmholtz", f"{_ax}_r_ohm", "0")
+    # MT-102 (dual COM): RS422 = RX, RS232 = TX/commands — same names as legacy calibrator.ini
+    if not cp.has_option("serial", "rs422_port"):
+        cp.set("serial", "rs422_port", "")
+    if not cp.has_option("serial", "rs232_port"):
+        cp.set("serial", "rs232_port", "")
+    if not cp.has_option("serial", "baud_rate"):
+        cp.set("serial", "baud_rate", str(_DEFAULT_MT102_BAUD))
+    if not cp.has_section("mt102_limits"):
+        cp.add_section("mt102_limits")
+    for _opt, _val in (
+        ("raw_green", str(MT102_RAW_GREEN)),
+        ("raw_amber", str(MT102_RAW_AMBER)),
+        ("gauss_green", str(MT102_GAUSS_GREEN)),
+        ("gauss_amber", str(MT102_GAUSS_AMBER)),
+    ):
+        if not cp.has_option("mt102_limits", _opt):
+            cp.set("mt102_limits", _opt, _val)
+    if not cp.has_section("mt102_display"):
+        cp.add_section("mt102_display")
+    if not cp.has_option("mt102_display", "mag_raw_to_gauss"):
+        cp.set("mt102_display", "mag_raw_to_gauss", str(MAG_RAW_TO_GAUSS))
+    if not cp.has_option("mt102_display", "mag_declination_deg"):
+        cp.set("mt102_display", "mag_declination_deg", "0")
+    # Legacy mistaken default: MagCal matrix uses 0.01 *inside* soft-iron terms only; Gauss is still
+    # corrected Int16 counts × a small G/count (~1e-5). 0.01 here produced ~tens–150 "G" at rest.
+    try:
+        _mrg = float(cp.get("mt102_display", "mag_raw_to_gauss", fallback=str(MAG_RAW_TO_GAUSS)).strip())
+    except ValueError:
+        cp.set("mt102_display", "mag_raw_to_gauss", format(MAG_RAW_TO_GAUSS, ".15g"))
+    else:
+        if math.isclose(_mrg, 0.01, rel_tol=0.0, abs_tol=1e-9):
+            cp.set("mt102_display", "mag_raw_to_gauss", format(MAG_RAW_TO_GAUSS, ".15g"))
+            try:
+                save_ini(cp)
+            except OSError:
+                pass
     return cp
 
 
@@ -435,8 +529,8 @@ class CalibratorController:
         return max(0, min(9, v))
 
     def _dbg(self, level: int, *args) -> None:
-        """Print to terminal if DEBUG in CalibratorUI.ini [debug] is >= level."""
-        if self._debug_level < level:
+        """Print to stdout only when effective DEBUG equals ``level`` (and level > 0)."""
+        if self._debug_level <= 0 or level <= 0 or self._debug_level != level:
             return
         print("[CalibratorUI DBG%d]" % level, *args, flush=True)
 
@@ -446,18 +540,29 @@ class CalibratorController:
         self._debug_level = self._read_debug_level()
         try:
             sys.stderr.write(
-                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout trace: [debug] DEBUG=1..9)\n"
-                % (CALIBRATOR_UI_VERSION, _INI_PATH, self._debug_level)
-            )
-            if self._debug_level >= 3:
-                sys.stderr.write(
-                    "[CalibratorUI] DEBUG>=3: TM CSV -> %s (file created on first TM:: after connect)\n"
-                    % (_TM_CSV_PATH.resolve(),)
+                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout DBG: exact N only; TM CSV file>=%d; MT102 MagTest.xlsx + wide UI DEBUG==%d)\n"
+                % (
+                    CALIBRATOR_UI_VERSION,
+                    _INI_PATH,
+                    self._debug_level,
+                    _TM_CSV_DEBUG_MIN,
+                    _MT102_TRACE_DEBUG_MIN,
                 )
-            elif self._debug_level < 3:
+            )
+            if self._debug_level == _TM_CSV_DEBUG_MIN:
                 sys.stderr.write(
-                    "[CalibratorUI] TM CSV (test_1.csv) is disabled; set [debug] DEBUG=3 in %s\n"
-                    % (_INI_PATH.resolve(),)
+                    "[CalibratorUI] DEBUG=%d: TM CSV -> %s (file created on first TM:: after connect)\n"
+                    % (_TM_CSV_DEBUG_MIN, _TM_CSV_PATH.resolve())
+                )
+            elif self._debug_level < _TM_CSV_DEBUG_MIN:
+                sys.stderr.write(
+                    "[CalibratorUI] TM CSV (test_1.csv) needs DEBUG>=%d in %s\n"
+                    % (_TM_CSV_DEBUG_MIN, _INI_PATH.resolve())
+                )
+            if self._debug_level == _MT102_TRACE_DEBUG_MIN:
+                sys.stderr.write(
+                    "[CalibratorUI] DEBUG=%d: MT102 wide data monitor; MagTest rows -> %s (needs openpyxl)\n"
+                    % (_MT102_TRACE_DEBUG_MIN, _MAG_TEST_XLSX_PATH.resolve())
                 )
             sys.stderr.flush()
         except Exception:
@@ -474,9 +579,11 @@ class CalibratorController:
         self._serial_saw_tm_txt_this_link: bool = False
         self._connect_mono_ts: float | None = None
         self._keepalive_stale_dbg_done: bool = False
-        # DEBUG≥2: one-shot TM line sample per link (see _apply_tm_line).
+        # DEBUG==_TM_CSV_DEBUG_MIN: one-shot TM line sample per link (see _apply_tm_line).
         self._tm_dbg_first_tm_after_connect: bool = False
         self._tm_dbg_setx_absent_x_present_pending: bool = False
+        # Last TM:: token map (Pico); coil_V for DEBUG==_MT102_TRACE_DEBUG_MIN MagTest.xlsx rows + UI.
+        self._last_tm_kv: dict[str, str] | None = None
         # Placeholders until host↔Pico protocol (set mA ack, closed-loop telem).
         self._configured_ok: bool = False
         self._closed_loop_ok: bool = False
@@ -486,15 +593,49 @@ class CalibratorController:
         # TM-derived (DC State LED, Initialized); _cl_before_tm saved before each TM line updates closed_loop_ok.
         self._meas_ok: bool | None = None
         self._cl_before_tm = False
+        self._mt102: object | None = None
+        self._viewer3d: QWidget | None = None
+        self._mt102_err_bridge = _Mt102ErrBridge(win)
+        self._mt102_err_bridge.err.connect(self._on_mt102_thread_error)
+        self._mt102_raw_green = MT102_RAW_GREEN
+        self._mt102_raw_amber = MT102_RAW_AMBER
+        self._mt102_gauss_green = MT102_GAUSS_GREEN
+        self._mt102_gauss_amber = MT102_GAUSS_AMBER
+        self._mag_raw_to_gauss = MAG_RAW_TO_GAUSS
+        self._mag_declination_deg = 0.0
+        self._reload_mt102_ini_preferences()
+        if self._mag_raw_to_gauss >= 0.009:
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] WARNING: [mt102_display] mag_raw_to_gauss=%s is very large; "
+                    "displayed G = corrected_counts × this (legacy 0.01 → ~40–150 G at rest). "
+                    "Try ~1e-5 or use Site Calibration → MT-102 Gauss scale. ini: %s\n"
+                    % (self._mag_raw_to_gauss, _INI_PATH.resolve())
+                )
+            except Exception:
+                pass
+        self._dbg_mt102_f_cal_logged = False
+        self._mt102_cal_que_mono: float = 0.0
+        self._mt102_fcal_polls_without_cal = 0
+        self._mt102_fcal_missing_logged = False
+        # Populated on first MT-102 Gauss UI refresh: (QLCDNumber, "X"|"Y"|"Z") via objectName regex.
+        self._mt102_field_gauss_lcds: list[tuple[QLCDNumber, str]] | None = None
+        self._mag_test_wb: object | None = None
+        self._mag_test_ws: object | None = None
+        self._mag_test_xlsx_row_count = 0
+        self._mag_test_xlsx_missing_logged = False
 
         self._combo_port = win.findChild(QComboBox, "comboBox_CalibratorPort")
         self._combo_baud = win.findChild(QComboBox, "comboBox_CalbratorBaud")
-        self._btn_connect = win.findChild(QPushButton, "pushButton_ConnectCalibrator")
+        self._btn_connect = win.findChild(QPushButton, "pushButton_ConnectAll")
         self._led_connected = win.findChild(QRadioButton, "radioButton_Connected")
         self._led_configured = win.findChild(QRadioButton, "radioButton_Configured")
         self._led_closed_loop = win.findChild(QRadioButton, "radioButton_ClosedLoop")
         self._led_initialized = win.findChild(QRadioButton, "radioButton_Initialized")
         self._led_dc_state = win.findChild(QRadioButton, "radioButton_DCState")
+        self._led_f_cal_applied: QRadioButton | None = win.findChild(
+            QRadioButton, "radioButton_F_CalApplied"
+        )
         self._text_out = win.findChild(QTextEdit, "textEdit_CalibratorTestOutput")
         self._btn_clear_text = win.findChild(QPushButton, "pushButton_ClearCalibratorText")
 
@@ -656,7 +797,7 @@ class CalibratorController:
 
         if not self._combo_port or not self._combo_baud or not self._btn_connect:
             raise RuntimeError(
-                "UI missing widgets: comboBox_CalibratorPort, comboBox_CalbratorBaud, pushButton_ConnectCalibrator"
+                "UI missing widgets: comboBox_CalibratorPort, comboBox_CalbratorBaud, pushButton_ConnectAll"
             )
         if (
             not self._led_connected
@@ -703,6 +844,9 @@ class CalibratorController:
             self._led_dc_state,
         ):
             _setup_display_only_led(rb)
+        if self._led_f_cal_applied is not None:
+            _setup_display_only_led(self._led_f_cal_applied)
+            _apply_led_color(self._led_f_cal_applied, "gray")
 
         self._status_main = QLabel("")
         self._status_conn = QLabel("Connection: Disconnected")
@@ -724,11 +868,15 @@ class CalibratorController:
         self._setup_settings_menu()
         self._sync_soft_reset_menu_from_ini()
         self._setup_help_menu()
+        self._setup_site_calibration_menu()
 
         self._btn_connect.clicked.connect(self._on_connect_clicked)
         self._btn_safe.clicked.connect(self._on_safe_calibrator)
         self._btn_reset.clicked.connect(self._on_reset_calibrator)
         self._btn_clear_text.clicked.connect(self._on_clear_calibrator_text)
+        _btn_mt102_clear = win.findChild(QPushButton, "pushButton_ClearDisplayedData")
+        if _btn_mt102_clear is not None:
+            _btn_mt102_clear.clicked.connect(self._on_clear_mt102_data)
         self._combo_port.currentIndexChanged.connect(self._on_serial_widget_changed)
         self._combo_baud.currentIndexChanged.connect(self._on_serial_widget_changed)
 
@@ -752,7 +900,10 @@ class CalibratorController:
             self._combo_baud.addItem(b)
 
     def _apply_ini_to_widgets(self) -> None:
-        port = self._ini.get("serial", "port", fallback="").strip()
+        port = (
+            self._ini.get("serial", "pico_port", fallback="").strip()
+            or self._ini.get("serial", "port", fallback="").strip()
+        )
         baud_str = self._ini.get("serial", "baud", fallback="115200").strip()
 
         idx = self._combo_baud.findText(baud_str)
@@ -1030,12 +1181,13 @@ class CalibratorController:
     def _settings_restore(self) -> None:
         self._ini = load_ini()
         self._debug_level = self._read_debug_level()
-        if self._debug_level < 3:
+        if self._debug_level < _TM_CSV_DEBUG_MIN:
             self._close_tm_csv()
         self._apply_settings_from_ini()
         self._apply_ini_to_widgets()
         self._sync_soft_reset_menu_from_ini()
         self._reload_helmholtz_geometry()
+        self._reload_mt102_ini_preferences()
         self._set_status("Settings restored from CalibratorUI.ini.")
         self._dbg(1, "settings restore; DEBUG level now", self._debug_level)
 
@@ -1092,8 +1244,223 @@ class CalibratorController:
             self._settings_persist_to_ini()
             self._set_status(f"Max current set to {self._settings_max_ma:.0f} mA (saved).")
 
+    def _settings_dialog_mt102_gauss_scale(self) -> None:
+        """Edit [mt102_display] mag_raw_to_gauss; save to CalibratorUI.ini on OK."""
+        dlg = QDialog(self._win)
+        dlg.setWindowTitle("MT-102 Gauss scale")
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            "Displayed Gauss = (factory F-corrected count, MagnetometerParser-style) × this factor. "
+            "Written to CalibratorUI.ini section [mt102_display] key mag_raw_to_gauss. "
+            "Tune at a fixed pose using a NIST-traceable Gaussmeter."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        form = QFormLayout()
+        sp = QDoubleSpinBox()
+        sp.setRange(1e-15, 1.0)
+        sp.setDecimals(12)
+        sp.setSingleStep(1e-8)
+        sp.setValue(float(self._mag_raw_to_gauss))
+        sp.setToolTip(
+            "Order-of-magnitude starting point after parser fix is often ~1e-5; "
+            "adjust until host Gauss matches your reference probe."
+        )
+        form.addRow("mag_raw_to_gauss:", sp)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = float(sp.value())
+        if not math.isfinite(v) or v <= 0.0:
+            self._set_status("MT-102 Gauss scale: invalid value (ignored).")
+            return
+        if not self._ini.has_section("mt102_display"):
+            self._ini.add_section("mt102_display")
+        self._ini.set("mt102_display", "mag_raw_to_gauss", format(v, ".15g"))
+        save_ini(self._ini)
+        self._mag_raw_to_gauss = v
+        self._set_status(
+            "MT-102 Gauss scale saved: mag_raw_to_gauss = %s (CalibratorUI.ini)."
+            % (format(v, ".15g"),)
+        )
+
+    def _find_menu_by_object_name(self, object_name: str) -> QMenu | None:
+        """
+        Return a ``QMenu`` by Designer ``objectName``.
+
+        Qt Designer often sets ``objectName`` on the **menubar QAction** (e.g. ``menuSite_Calibration``)
+        that owns the dropdown, not on the ``QMenu`` itself — check both.
+        """
+        mb = self._win.menuBar()
+        found = mb.findChild(QMenu, object_name, Qt.FindChildOption.FindChildrenRecursively)
+        if found is not None:
+            return found
+        for a in mb.actions():
+            sub = a.menu()
+            if sub is None:
+                continue
+            if sub.objectName() == object_name or a.objectName() == object_name:
+                return sub
+        return None
+
+    def _setup_site_calibration_menu(self) -> None:
+        """Add Site Calibration menu actions (Gaussmeter / MT-102 scale). Requires ``menuSite_Calibration`` in .ui."""
+        menu = self._find_menu_by_object_name("menuSite_Calibration")
+        if menu is None:
+            self._dbg(
+                1,
+                "UI: no menubar menu for objectName menuSite_Calibration (set on QAction or QMenu) — "
+                "Site Calibration entries not added.",
+            )
+            return
+        self._ensure_menu_action_on_menu(
+            menu, "MT-102 Gauss scale...", self._settings_dialog_mt102_gauss_scale
+        )
+        self._ensure_menu_action_on_menu(
+            menu,
+            "Align MT-102 scale to reference meter...",
+            self._dialog_align_mt102_scale_to_reference,
+        )
+
+    @staticmethod
+    def _ensure_menu_action_on_menu(menu: QMenu, label: str, slot) -> None:
+        if CalibratorController._menu_has_action(menu, label):
+            return
+        act = QAction(label, menu)
+        act.triggered.connect(slot)
+        menu.addAction(act)
+
+    def _dialog_align_mt102_scale_to_reference(self) -> None:
+        """
+        Set mag_raw_to_gauss from a NIST-traceable reading: new_scale = old_scale × (B_ref / B_host)
+        for the chosen component or |B|.
+        """
+        if MT102Interface is None or not getattr(self, "_mt102", None) or self._mt102 is None:
+            QMessageBox.warning(self._win, "Site Calibration", "MT-102 is not connected.")
+            return
+        if not self._mt102.is_connected():
+            QMessageBox.warning(self._win, "Site Calibration", "MT-102 is not connected.")
+            return
+        try:
+            cal = self._mt102.get_cal_data()
+            mag = self._mt102.get_mag_data(timeout=0)
+        except Exception as e:
+            QMessageBox.warning(self._win, "Site Calibration", str(e))
+            return
+        if cal is None or mag is None:
+            QMessageBox.warning(
+                self._win,
+                "Site Calibration",
+                "Need factory F-cal and a fresh M packet (connect MT-102, wait for samples).",
+            )
+            return
+        try:
+            gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
+        except Exception as e:
+            QMessageBox.warning(self._win, "Site Calibration", str(e))
+            return
+        if not all(math.isfinite(v) for v in (gx, gy, gz)):
+            QMessageBox.warning(
+                self._win, "Site Calibration", "Current Gauss values are not finite."
+            )
+            return
+        b_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
+
+        dlg = QDialog(self._win)
+        dlg.setWindowTitle("Align MT-102 scale to reference meter")
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            "Uses one simultaneous reading: host Gauss (from current mag_raw_to_gauss) vs your "
+            "calibrated Gaussmeter. Enter the reference using the same axis sign as the host for "
+            "X/Y/Z, or a non-negative |B| for magnitude. "
+            "New scale = old_scale × (B_ref ÷ B_host) for the chosen quantity."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        cur = QLabel(
+            "Host (now):  Gx=%.6f  Gy=%.6f  Gz=%.6f  |B|=%.6f G"
+            % (gx, gy, gz, b_mag)
+        )
+        cur.setStyleSheet("font-family: monospace;")
+        lay.addWidget(cur)
+        form = QFormLayout()
+        combo = QComboBox()
+        combo.addItem("X component (Gx)", "X")
+        combo.addItem("Y component (Gy)", "Y")
+        combo.addItem("Z component (Gz)", "Z")
+        combo.addItem("|B| magnitude", "M")
+        form.addRow("Match:", combo)
+        ref_sp = QDoubleSpinBox()
+        ref_sp.setRange(-100.0, 100.0)
+        ref_sp.setDecimals(6)
+        ref_sp.setSingleStep(0.000001)
+        ref_sp.setValue(0.0)
+        ref_sp.setToolTip("Reading from your traceable Gaussmeter at this instant (Gauss).")
+        form.addRow("Reference Gauss:", ref_sp)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        mode = combo.currentData()
+        ref = float(ref_sp.value())
+        if not math.isfinite(ref):
+            QMessageBox.warning(self._win, "Site Calibration", "Invalid reference value.")
+            return
+        if mode == "X":
+            host = gx
+        elif mode == "Y":
+            host = gy
+        elif mode == "Z":
+            host = gz
+        else:
+            host = b_mag
+            if ref < 0.0:
+                QMessageBox.warning(
+                    self._win,
+                    "Site Calibration",
+                    "For |B|, enter a non-negative reference magnitude.",
+                )
+                return
+        if abs(host) < 1e-30:
+            QMessageBox.warning(
+                self._win,
+                "Site Calibration",
+                "Host value for the chosen quantity is ~0; cannot compute scale (try another axis or pose).",
+            )
+            return
+        old = float(self._mag_raw_to_gauss)
+        new_scale = old * (ref / host)
+        if not math.isfinite(new_scale) or new_scale <= 0.0:
+            QMessageBox.warning(self._win, "Site Calibration", "Computed scale is invalid.")
+            return
+        if not self._ini.has_section("mt102_display"):
+            self._ini.add_section("mt102_display")
+        self._ini.set("mt102_display", "mag_raw_to_gauss", format(new_scale, ".15g"))
+        save_ini(self._ini)
+        self._mag_raw_to_gauss = new_scale
+        self._set_status(
+            "Site Calibration: mag_raw_to_gauss = %s (was %s). Saved to CalibratorUI.ini."
+            % (format(new_scale, ".15g"), format(old, ".15g"))
+        )
+
     def _refresh_com_ports(self, select_saved: bool = False) -> None:
-        saved = self._ini.get("serial", "port", fallback="").strip()
+        saved = (
+            self._ini.get("serial", "pico_port", fallback="").strip()
+            or self._ini.get("serial", "port", fallback="").strip()
+        )
         ports = enumerate_com_ports()
         self._combo_port.blockSignals(True)
         self._combo_port.clear()
@@ -1118,7 +1485,9 @@ class CalibratorController:
             return 115200
 
     def _save_serial_ini(self) -> None:
-        self._ini.set("serial", "port", self._current_port())
+        cur = self._current_port()
+        self._ini.set("serial", "pico_port", cur)
+        self._ini.set("serial", "port", cur)
         self._ini.set("serial", "baud", str(self._current_baud()))
         save_ini(self._ini)
 
@@ -1131,6 +1500,15 @@ class CalibratorController:
 
     def _on_clear_calibrator_text(self) -> None:
         self._text_out.clear()
+
+    def _on_clear_mt102_data(self) -> None:
+        te = self._win.findChild(QTextEdit, "textEdit_MT102_Data")
+        if not te and hasattr(self._win, "centralWidget"):
+            cw = self._win.centralWidget()
+            if cw:
+                te = cw.findChild(QTextEdit, "textEdit_MT102_Data")
+        if te is not None:
+            te.clear()
 
     def _append_pico_log_line(self, text: str) -> None:
         """Append one line to the Calibrator log (TXT:: payload, no prefix)."""
@@ -1246,15 +1624,17 @@ class CalibratorController:
         of set_X_v=0.000 (i.e. '=0.000 set_Y_v=...') while the prefix stayed in the buffer or prior chunk.
         """
         t = line.strip("\r\n").strip()
+        if t.startswith("'"):
+            t = t[1:].lstrip()
         if re.match(r"(?i)^TM::", t):
-            return line
+            return t
         m = re.match(r"^=(\d+(?:\.\d+)?|nan)\s+", t, re.I)
         if not m:
-            return line
+            return t
         rest = t[m.end() :].lstrip()
         if re.match(r"(?i)^set_[yz]_v\s*=", rest):
             return "set_X_v=" + m.group(1) + " " + rest
-        return line
+        return t
 
     @staticmethod
     def _parse_tm_tokens(line: str) -> dict[str, str]:
@@ -1319,6 +1699,21 @@ class CalibratorController:
         i_m = abs(float(m_ma)) / 1000.0
         return i_m if math.isfinite(i_m) else None
 
+    def _coil_v_xyz_from_last_tm(self) -> tuple[float | None, float | None, float | None]:
+        """Pico TM:: coil_V_* or set_*_v (V); None if no TM yet or key missing."""
+        kv = self._last_tm_kv
+        if not kv:
+            return (None, None, None)
+        trip: list[float | None] = []
+        for ax in ("X", "Y", "Z"):
+            v = self._tm_float(kv, "coil_V_%s" % ax)
+            if v is None:
+                v = self._tm_float(kv, "set_%s_v" % ax)
+            if v is None:
+                v = self._tm_float(kv, "set_%s_v" % ax.lower())
+            trip.append(v)
+        return (trip[0], trip[1], trip[2])
+
     def _tm_gauss_axis_G(self, kv: dict[str, str], ax: str) -> float | None:
         """|B| in Gauss at Helmholtz midpoint for one axis (same model as Gauss LCDs)."""
         geom = self._helm_geom.get(ax)
@@ -1344,7 +1739,7 @@ class CalibratorController:
             self._tm_csv_writer = None
 
     def _ensure_tm_csv(self) -> None:
-        if self._debug_level < 3:
+        if self._debug_level < _TM_CSV_DEBUG_MIN:
             return
         if self._tm_csv_writer is not None and self._tm_csv_fp is not None:
             try:
@@ -1391,12 +1786,12 @@ class CalibratorController:
                 )
                 self._tm_csv_fp.flush()
         except Exception as e:
-            self._dbg(1, "TM CSV: open failed:", e)
+            self._dbg(_TM_CSV_DEBUG_MIN, "TM CSV: open failed:", e)
             self._close_tm_csv()
 
     def _append_tm_csv_row(self, kv: dict[str, str]) -> None:
-        """DEBUG≥3: append one row to test_1.csv and print a compact TM_CSV line."""
-        if self._debug_level < 3:
+        """DEBUG≥4: append one row to test_1.csv and print a compact TM_CSV line."""
+        if self._debug_level < _TM_CSV_DEBUG_MIN:
             return
         self._ensure_tm_csv()
         if self._tm_csv_writer is None or self._tm_csv_fp is None:
@@ -1445,7 +1840,7 @@ class CalibratorController:
             )
             self._tm_csv_fp.flush()
             self._dbg(
-                3,
+                _TM_CSV_DEBUG_MIN,
                 "TM_CSV",
                 "t=%.3f" % ts,
                 "set_V=(%s,%s,%s)"
@@ -1469,7 +1864,7 @@ class CalibratorController:
                 "meas_ok=%s" % ("-" if mk is None else str(mk)),
             )
         except Exception as e:
-            self._dbg(1, "TM CSV: row failed:", e)
+            self._dbg(_TM_CSV_DEBUG_MIN, "TM CSV: row failed:", e)
 
     def _update_measured_lcds_from_tm(self, kv: dict[str, str]) -> None:
         """Refresh X/Y/Z measured LCDs from TM:: key=value (realtime for all axes)."""
@@ -1905,8 +2300,7 @@ class CalibratorController:
         line = f"set_{axl}_v {val:.3f}\r\n"
         try:
             self._dbg(1, "action: Set", axis, f"{val:.3f} V", "from", vspin.objectName())
-            if self._debug_level >= 2:
-                self._dbg(2, "Set TX", line.strip())
+            self._dbg(2, "Set TX", line.strip())
             self._serial.write(line.encode("ascii", errors="replace"))
             self._serial.flush()
             if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
@@ -1919,7 +2313,7 @@ class CalibratorController:
         """Telemetry line: updates status LEDs; not copied to the text log."""
         line = self._repair_tm_orphan_set_x_prefix(line)
         kv = self._parse_tm_tokens(line)
-        if self._debug_level >= 2:
+        if self._debug_level == _TM_CSV_DEBUG_MIN:
             s_dbg = line.strip("\r\n").strip()
             if len(s_dbg) > 420:
                 s_dbg = s_dbg[:417] + "..."
@@ -1929,13 +2323,13 @@ class CalibratorController:
                 self._tm_dbg_setx_absent_x_present_pending = False
                 self._tm_dbg_first_tm_after_connect = False
                 self._dbg(
-                    2,
+                    _TM_CSV_DEBUG_MIN,
                     "TM dbg (no set_X_v/set_x_v token but X_ma or coil_V_X present):",
                     s_dbg,
                 )
             elif self._tm_dbg_first_tm_after_connect:
                 self._tm_dbg_first_tm_after_connect = False
-                self._dbg(2, "TM dbg (first TM line this link):", s_dbg)
+                self._dbg(_TM_CSV_DEBUG_MIN, "TM dbg (first TM line this link):", s_dbg)
         self._cl_before_tm = self._closed_loop_ok
         va = self._tm_int(kv, "alarm")
         vs = self._tm_int(kv, "safe")
@@ -1958,6 +2352,7 @@ class CalibratorController:
         self._update_null_indicator_from_tm(kv)
         self._note_pico_liveness()
         self._append_tm_csv_row(kv)
+        self._last_tm_kv = dict(kv)
 
     def _process_serial_line(self, line: str) -> None:
         s = line.strip("\r\n").strip()
@@ -1965,8 +2360,7 @@ class CalibratorController:
             s = s[1:].lstrip()
         if not s:
             return
-        if self._debug_level >= 3 and not re.match(r"(?i)^TM::", s):
-            self._dbg(3, "RX (non-TM)", repr(s)[:500])
+        s = self._repair_tm_orphan_set_x_prefix(s)
         # Case-insensitive prefix; length-safe payload (handles TXT:: vs TXT::␠ from firmware).
         m_txt = re.match(r"(?i)^TXT::\s*", s)
         if m_txt:
@@ -1983,8 +2377,8 @@ class CalibratorController:
             elif pl.startswith("OK safe_reset") or pl.startswith("STATUS safe_reset OK"):
                 self._pico_has_error = False
                 self._update_status_leds()
-            if self._debug_level >= 2:
-                self._dbg(2, "TXT", payload[:220].replace("\r", " "))
+            if self._debug_level == _TM_CSV_DEBUG_MIN:
+                self._dbg(_TM_CSV_DEBUG_MIN, "TXT", payload[:220].replace("\r", " "))
             self._try_parse_pico_version_from_txt_payload(payload)
             self._append_pico_log_line(payload)
             return
@@ -1994,9 +2388,10 @@ class CalibratorController:
         if self._line_looks_like_tm_telemetry(s):
             self._apply_tm_line(s)
             return
-        # Anything else (unprefixed boot noise, mis-framed lines): show so nothing is silent.
-        if self._debug_level >= 2:
-            self._dbg(2, "OTHER (unprefixed)", s[:220].replace("\r", " "))
+        # Truly non-telemetry (boot noise, mis-framed lines). Do not log TM-shaped rows here —
+        # orphan `=0.000 set_Y_v=...` lines are repaired + handled above.
+        if self._debug_level == _TM_CSV_DEBUG_MIN:
+            self._dbg(_TM_CSV_DEBUG_MIN, "RX (unprefixed)", repr(s)[:500])
         self._append_pico_log_line(s)
 
     def _serial_drain_bytes_only(self) -> int:
@@ -2058,7 +2453,10 @@ class CalibratorController:
             QTimer.singleShot(50, lambda n=nxt: self._post_connect_serial_catchup(n))
 
     def _poll_serial(self, max_lines: int | None = None) -> None:
+        # Run _mag_poll after USB TM:: processing (below) so MagTest.xlsx / LCDs and
+        # _last_tm_kv refer to the same telemetry window; MT102 sample is still current.
         if self._serial is None:
+            self._mag_poll()
             return
         if max_lines is None:
             line_cap = _MAX_SERIAL_LINES_PER_TICK
@@ -2069,9 +2467,16 @@ class CalibratorController:
             chunk = self._serial.read(4096)
             if chunk:
                 self._rx_buf.extend(chunk)
-                if self._debug_level >= 2:
-                    self._dbg(2, "serial read", len(chunk), "bytes; rx_buf total", len(self._rx_buf))
+                if self._debug_level == _TM_CSV_DEBUG_MIN:
+                    self._dbg(
+                        _TM_CSV_DEBUG_MIN,
+                        "serial read",
+                        len(chunk),
+                        "bytes; rx_buf total",
+                        len(self._rx_buf),
+                    )
         except Exception:
+            self._mag_poll()
             return
         processed = 0
         while processed < line_cap:
@@ -2103,7 +2508,7 @@ class CalibratorController:
                     )
                 except Exception:
                     pass
-        if self._debug_level >= 1 and processed >= line_cap:
+        if self._debug_level == 1 and processed >= line_cap:
             nl = self._rx_buf.find(b"\n")
             cr = self._rx_buf.find(b"\r")
             if nl >= 0 or cr >= 0:
@@ -2116,6 +2521,7 @@ class CalibratorController:
                     "bytes still buffered with more line(s) pending",
                 )
         self._check_pico_alive_stale()
+        self._mag_poll()
 
     def _note_pico_liveness(self) -> None:
         """Update last traffic time; clear stale LED/status if recovering."""
@@ -2215,14 +2621,661 @@ class CalibratorController:
         self._closed_loop_ok = bool(ok)
         self._update_status_leds()
 
+    def _reload_mt102_ini_preferences(self) -> None:
+        """LCD color limits and declination from [mt102_limits] / [mt102_display]."""
+        ini = self._ini
+        if ini.has_section("mt102_limits"):
+            try:
+                self._mt102_raw_green = int(
+                    ini.get("mt102_limits", "raw_green", fallback=str(MT102_RAW_GREEN))
+                )
+            except ValueError:
+                self._mt102_raw_green = MT102_RAW_GREEN
+            try:
+                self._mt102_raw_amber = int(
+                    ini.get("mt102_limits", "raw_amber", fallback=str(MT102_RAW_AMBER))
+                )
+            except ValueError:
+                self._mt102_raw_amber = MT102_RAW_AMBER
+            try:
+                self._mt102_gauss_green = float(
+                    ini.get("mt102_limits", "gauss_green", fallback=str(MT102_GAUSS_GREEN))
+                )
+            except ValueError:
+                self._mt102_gauss_green = MT102_GAUSS_GREEN
+            try:
+                self._mt102_gauss_amber = float(
+                    ini.get("mt102_limits", "gauss_amber", fallback=str(MT102_GAUSS_AMBER))
+                )
+            except ValueError:
+                self._mt102_gauss_amber = MT102_GAUSS_AMBER
+        if ini.has_section("mt102_display"):
+            try:
+                # Gauss = fcal_corrected_counts × mag_raw_to_gauss (see mt102_interface + ini).
+                self._mag_raw_to_gauss = float(
+                    ini.get(
+                        "mt102_display",
+                        "mag_raw_to_gauss",
+                        fallback=str(MAG_RAW_TO_GAUSS),
+                    )
+                )
+            except ValueError:
+                self._mag_raw_to_gauss = MAG_RAW_TO_GAUSS
+            try:
+                self._mag_declination_deg = float(
+                    ini.get("mt102_display", "mag_declination_deg", fallback="0")
+                )
+            except ValueError:
+                self._mag_declination_deg = 0.0
+
+    def _on_mt102_thread_error(self, msg: str) -> None:
+        self._set_status("MT-102: %s" % (msg,))
+
+    @staticmethod
+    def _find_lcd_number(window: QMainWindow, object_name: str) -> QLCDNumber | None:
+        lcd = window.findChild(QLCDNumber, object_name)
+        if lcd is not None:
+            return lcd
+        cw = window.centralWidget() if hasattr(window, "centralWidget") else None
+        if cw is not None:
+            lcd = cw.findChild(QLCDNumber, object_name)
+            if lcd is not None:
+                return lcd
+        return None
+
+    _RE_MT102_FIELD_GAUSS_LCD = re.compile(
+        r"^lcdNumber_(?:MT102|Mt102)_([XYZ])_(?:[Gg]auss)$"
+    )
+
+    def _discover_mt102_field_gauss_lcds(self) -> list[tuple[QLCDNumber, str]]:
+        """Bind MT-102 *field* Gauss seven-segments by objectName (any Mt/MT + Gauss/gauss spelling)."""
+        out: list[tuple[QLCDNumber, str]] = []
+        seen: set[int] = set()
+        for lcd in self._win.findChildren(QLCDNumber):
+            m = self._RE_MT102_FIELD_GAUSS_LCD.match(lcd.objectName())
+            if not m:
+                continue
+            lid = id(lcd)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            out.append((lcd, m.group(1)))
+            lcd.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
+            if hasattr(lcd, "setSmallDecimalPoint"):
+                lcd.setSmallDecimalPoint(True)
+            mw = max(lcd.minimumWidth(), 100)
+            mh = max(lcd.minimumHeight(), 40)
+            lcd.setMinimumSize(mw, mh)
+        return out
+
+    @staticmethod
+    def _field_vector_to_rotation(
+        bx: float, by: float, bz: float, mag_declination_deg: float = 0.0
+    ) -> tuple[float, float, float]:
+        """Magnetic field vector (consistent units) → viewer roll, pitch, yaw (degrees)."""
+        mag_len = math.sqrt(bx * bx + by * by + bz * bz)
+        if mag_len < 1e-9:
+            return (0.0, 0.0, 0.0)
+        nx, ny, nz = bx / mag_len, by / mag_len, bz / mag_len
+        heading_mag = math.degrees(math.atan2(ny, nx))
+        yaw = heading_mag + mag_declination_deg
+        pitch = -math.degrees(math.asin(max(-1, min(1, nz))))
+        roll = 90.0 * nx if abs(nx) > 0.3 else 0.0
+        return (roll, pitch, yaw)
+
+    @staticmethod
+    def _mag_data_to_rotation(mag, mag_declination_deg: float = 0.0) -> tuple[float, float, float]:
+        """Raw mag counts → viewer rotation (same geometry as _field_vector_to_rotation)."""
+        return CalibratorController._field_vector_to_rotation(
+            float(mag.x), float(mag.y), float(mag.z), mag_declination_deg
+        )
+
+    @staticmethod
+    def _mag_lcd_color_raw(raw_val: int, green: int, amber: int) -> str:
+        a = abs(int(raw_val))
+        if a <= green:
+            return "green"
+        if a <= amber:
+            return MT102_AMBER
+        return "red"
+
+    @staticmethod
+    def _mag_lcd_color_gauss(gauss_val: float, green: float, amber: float) -> str:
+        a = abs(float(gauss_val))
+        if a <= green:
+            return "green"
+        if a <= amber:
+            return MT102_AMBER
+        return "red"
+
+    def _disconnect_mt102_only(self) -> None:
+        if getattr(self, "_mt102", None) is not None:
+            try:
+                self._mt102.disconnect()
+            except Exception:
+                pass
+            self._mt102 = None
+            self._dbg_mt102_f_cal_logged = False
+            self._mt102_cal_que_mono = 0.0
+            self._mt102_fcal_polls_without_cal = 0
+            self._mt102_fcal_missing_logged = False
+            self._close_mag_test_xlsx()
+            self._refresh_mt102_fcal_applied_led()
+        vd = getattr(self, "_viewer3d", None)
+        if vd is not None and hasattr(vd, "set_rotation"):
+            try:
+                vd.set_rotation(0, 0, 0)
+            except Exception:
+                pass
+
+    def _connect_mt102_after_pico(self) -> None:
+        """After Pico serial is up: open MT-102 from ini (RS422 RX + RS232 TX when both set)."""
+        if MT102Interface is None:
+            self._dbg(3, "MT102: skipped (mt102_interface import failed)")
+            return
+        rs422 = self._ini.get("serial", "rs422_port", fallback="").strip()
+        rs232 = self._ini.get("serial", "rs232_port", fallback="").strip()
+        if not rs422:
+            rs422 = self._ini.get("serial", "mt102_rs422_port", fallback="").strip()
+        if not rs232:
+            rs232 = self._ini.get("serial", "mt102_rs232_port", fallback="").strip()
+        try:
+            br = self._ini.get(
+                "serial", "baud_rate", fallback=str(_DEFAULT_MT102_BAUD)
+            ).strip()
+            if not br:
+                br = self._ini.get(
+                    "serial", "mt102_baud", fallback=str(_DEFAULT_MT102_BAUD)
+                ).strip()
+            baud = int(br)
+        except ValueError:
+            baud = _DEFAULT_MT102_BAUD
+        if not rs422 and not rs232:
+            self._dbg(3, "MT102: skipped (rs422_port and rs232_port empty in ini)")
+            return
+        use_dual = bool(rs422 and rs232)
+        if use_dual:
+            port, port_tx = rs422, rs232
+        else:
+            port = rs422 or rs232
+            port_tx = None
+            if not port or port == "(no ports)":
+                self._dbg(3, "MT102: skipped (no valid COM in ini)")
+                return
+        try:
+            self._mt102 = MT102Interface(
+                on_error=lambda m: self._mt102_err_bridge.err.emit(str(m)),
+                serial_factory=None,
+            )
+            if not self._mt102.connect(port, baud, port_tx=port_tx):
+                self._mt102 = None
+                raise RuntimeError("MT-102 connect() returned False")
+        except Exception as e:
+            self._mt102 = None
+            self._dbg(3, "MT102 connect failed:", e)
+            QMessageBox.warning(
+                self._win,
+                "MT-102",
+                "Pico is connected, but MT-102 failed to open:\n%s\n\n"
+                "Check [serial] rs422_port / rs232_port / baud_rate in %s."
+                % (e, _INI_PATH.name),
+            )
+            return
+        te = self._win.findChild(QTextEdit, "textEdit_MT102_Data")
+        if te is not None:
+            te.clear()
+        msg = (
+            "MT-102: RX=%s TX=%s @ %d"
+            % (port, port_tx if port_tx else "(same)", baud)
+            if use_dual
+            else "MT-102: %s @ %d" % (port, baud)
+        )
+        self._dbg(3, "connect:", msg)
+        self._set_status("%s | %s" % (self._status_main.text(), msg))
+        self._mt102_fcal_missing_logged = False
+        self._mt102_fcal_polls_without_cal = 0
+        try:
+            if hasattr(self._mt102, "request_cal_data"):
+                self._mt102.request_cal_data()
+            self._mt102_cal_que_mono = time.monotonic()
+        except Exception:
+            pass
+
+    def _refresh_mt102_fcal_applied_led(self) -> None:
+        """Indicator ``radioButton_F_CalApplied``: gray if MT-102 not connected; else lime or red."""
+        rb = self._led_f_cal_applied
+        if rb is None:
+            return
+        m = getattr(self, "_mt102", None)
+        if m is None:
+            _apply_led_color(rb, "gray")
+            return
+        try:
+            if not m.is_connected():
+                _apply_led_color(rb, "gray")
+                return
+            cal = m.get_cal_data() if hasattr(m, "get_cal_data") else None
+            _apply_led_color(rb, "lime" if cal is not None else "red_bright")
+        except Exception:
+            _apply_led_color(rb, "red_bright")
+
+    def _maybe_request_mt102_fcal(self) -> None:
+        """Re-send QUE until flash F-cal is parsed (QUE-only TX; safe on MT-102)."""
+        m = getattr(self, "_mt102", None)
+        if m is None or not hasattr(m, "get_cal_data") or not hasattr(m, "request_cal_data"):
+            return
+        try:
+            if m.get_cal_data() is not None:
+                return
+            if not m.is_connected():
+                return
+        except Exception:
+            return
+        now = time.monotonic()
+        if now - self._mt102_cal_que_mono < 1.5:
+            return
+        self._mt102_cal_que_mono = now
+        try:
+            m.request_cal_data()
+        except Exception:
+            pass
+
+    def _close_mag_test_xlsx(self) -> None:
+        """Flush and close DEBUG=5 MagTest workbook (MT-102 disconnect or app disconnect)."""
+        wb = self._mag_test_wb
+        if wb is None:
+            return
+        try:
+            wb.save(str(_MAG_TEST_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] MagTest.xlsx save failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+        self._mag_test_wb = None
+        self._mag_test_ws = None
+        self._mag_test_xlsx_row_count = 0
+
+    def _ensure_mag_test_xlsx(self) -> bool:
+        """Open ``MagTest.xlsx`` with header row when DEBUG=5 and openpyxl is installed."""
+        if self._debug_level != _MT102_TRACE_DEBUG_MIN:
+            return False
+        if _OpenpyxlWorkbook is None:
+            if not self._mag_test_xlsx_missing_logged:
+                self._mag_test_xlsx_missing_logged = True
+                try:
+                    sys.stderr.write(
+                        "[CalibratorUI] DEBUG=5: pip install openpyxl to write %s\n"
+                        % (_MAG_TEST_XLSX_PATH.resolve(),)
+                    )
+                except Exception:
+                    pass
+            return False
+        if self._mag_test_wb is not None:
+            return True
+        try:
+            wb = _OpenpyxlWorkbook()
+            ws = wb.active
+            ws.title = "MagTest"
+            ws.append(
+                [
+                    "timestamp",
+                    "coil_V_X",
+                    "coil_V_Y",
+                    "coil_V_Z",
+                    "RAW_X",
+                    "Gauss_X",
+                    "RAW_Y",
+                    "Gauss_Y",
+                    "RAW_Z",
+                    "Gauss_Z",
+                ]
+            )
+            self._mag_test_wb = wb
+            self._mag_test_ws = ws
+            self._mag_test_xlsx_row_count = 0
+            wb.save(str(_MAG_TEST_XLSX_PATH))
+        except Exception as e:
+            self._mag_test_wb = None
+            self._mag_test_ws = None
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] MagTest.xlsx init failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _append_mag_test_xlsx_row(
+        self,
+        vx: float | None,
+        vy: float | None,
+        vz: float | None,
+        mag: object,
+        gx: float,
+        gy: float,
+        gz: float,
+    ) -> None:
+        """One DEBUG=5 row: host time, TM coil V, MT102 raw + Gauss (factory F-cal only)."""
+        if not self._ensure_mag_test_xlsx():
+            return
+        ws = self._mag_test_ws
+        wb = self._mag_test_wb
+        if ws is None or wb is None:
+            return
+
+        def _fin(v: float | None) -> float | None:
+            if v is None or not math.isfinite(v):
+                return None
+            return float(v)
+
+        def _fin_g(v: float) -> float | None:
+            if not math.isfinite(v):
+                return None
+            return float(v)
+
+        try:
+            ws.append(
+                [
+                    datetime.datetime.now(),
+                    _fin(vx),
+                    _fin(vy),
+                    _fin(vz),
+                    int(getattr(mag, "x")),
+                    _fin_g(gx),
+                    int(getattr(mag, "y")),
+                    _fin_g(gy),
+                    int(getattr(mag, "z")),
+                    _fin_g(gz),
+                ]
+            )
+            self._mag_test_xlsx_row_count += 1
+            if self._mag_test_xlsx_row_count % _MAG_TEST_XLSX_SAVE_EVERY_N == 0:
+                wb.save(str(_MAG_TEST_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] MagTest.xlsx append failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+            self._close_mag_test_xlsx()
+
+    def _mag_poll(self) -> None:
+        """Poll MT-102 for M packets; update data monitor, optional LCDs, 3D viewer."""
+        if not getattr(self, "_mt102", None) or self._mt102 is None:
+            return
+        try:
+            if not self._mt102.is_connected():
+                self._disconnect_mt102_only()
+                self._set_status("MT-102 connection lost — check cable or port")
+                return
+        except Exception:
+            return
+        self._maybe_request_mt102_fcal()
+        self._refresh_mt102_fcal_applied_led()
+        try:
+            mag = self._mt102.get_mag_data(timeout=0)
+        except Exception:
+            return
+        if not self._dbg_mt102_f_cal_logged and hasattr(self._mt102, "get_cal_data"):
+            try:
+                c0 = self._mt102.get_cal_data()
+                if c0 is not None:
+                    self._dbg_mt102_f_cal_logged = True
+                    self._dbg(
+                        3,
+                        "MT102: factory F-cal loaded; field = MagnetometerParser math × "
+                        "ini [mt102_display] mag_raw_to_gauss. serial=%s"
+                        % (getattr(c0, "serial_number", "?"),),
+                    )
+            except Exception:
+                pass
+        if mag is None:
+            te = self._win.findChild(QTextEdit, "textEdit_MT102_Data")
+            if not te and hasattr(self._win, "centralWidget"):
+                cw = self._win.centralWidget()
+                if cw:
+                    te = cw.findChild(QTextEdit, "textEdit_MT102_Data")
+            if te and hasattr(self._mt102, "get_debug_info"):
+                info = self._mt102.get_debug_info()
+                br = info.get("bytes_received", 0)
+                mp = info.get("m_packets_parsed", 0)
+                fp = info.get("f_packets_parsed", 0)
+                last_raw = info.get("last_raw", b"")[:64]
+                raw_hex = " ".join("%02X" % b for b in last_raw) if last_raw else "(none)"
+                msg = "RX: %s bytes, %s M packets, %s F (flash cal) packets\n" % (br, mp, fp)
+                msg += "Check: MT-102 output → rs422_port, QUE on rs232_port, baud_rate in ini\n"
+                if br == 0:
+                    msg += "If bytes stay 0: try swapping rs232_port ↔ rs422_port in ini\n"
+                if br > 0 and mp == 0:
+                    msg += "Last raw (hex): %s\n" % raw_hex
+                te.setPlainText(msg)
+            return
+        cal = None
+        try:
+            if hasattr(self._mt102, "get_cal_data"):
+                cal = self._mt102.get_cal_data()
+        except Exception:
+            cal = None
+        if cal is None:
+            self._mt102_fcal_polls_without_cal += 1
+            if (
+                self._mt102_fcal_polls_without_cal >= 240
+                and not self._mt102_fcal_missing_logged
+            ):
+                self._mt102_fcal_missing_logged = True
+                self._dbg(
+                    3,
+                    "MT102: factory F-cal still missing after repeated QUE; "
+                    "Gauss/G columns stay blank until the F packet parses.",
+                )
+            gx = gy = gz = float("nan")
+            have_g = False
+        else:
+            self._mt102_fcal_polls_without_cal = 0
+            try:
+                gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
+                have_g = all(math.isfinite(v) for v in (gx, gy, gz))
+            except Exception:
+                return
+        if self._debug_level == _MT102_TRACE_DEBUG_MIN:
+            vx, vy, vz = self._coil_v_xyz_from_last_tm()
+            self._append_mag_test_xlsx_row(vx, vy, vz, mag, gx, gy, gz)
+        for name, val in (
+            ("lcdNumber_MT102_X_raw", mag.x),
+            ("lcdNumber_MT102_Y_raw", mag.y),
+            ("lcdNumber_MT102_Z_raw", mag.z),
+        ):
+            lcd = self._find_lcd_number(self._win, name)
+            if lcd:
+                lcd.setDigitCount(4)
+                lcd.setMode(QLCDNumber.Mode.Hex)
+                lcd.display(val & 0xFFFF)
+                color = self._mag_lcd_color_raw(
+                    val, self._mt102_raw_green, self._mt102_raw_amber
+                )
+                lcd.setStyleSheet(
+                    "background-color: %s; color: %s;" % (MT102_LCD_BG, color)
+                )
+        # Discover once: MOPS.ui mixes Mt102 vs MT102 and Gauss vs gauss; findChild-by-fixed-list can miss Y/Z.
+        if self._mt102_field_gauss_lcds is None:
+            self._mt102_field_gauss_lcds = self._discover_mt102_field_gauss_lcds()
+            n = len(self._mt102_field_gauss_lcds)
+            if n != 3 and not getattr(self, "_mt102_field_gauss_disc_warned", False):
+                self._mt102_field_gauss_disc_warned = True
+                try:
+                    sys.stderr.write(
+                        "[CalibratorUI] MT102 field Gauss: found %d QLCDNumber(s) %s; "
+                        "expected 3 matching lcdNumber_(MT102|Mt102)_[XYZ]_(Gauss|gauss).\n"
+                        % (
+                            n,
+                            [(lcd.objectName(), ax) for lcd, ax in self._mt102_field_gauss_lcds],
+                        )
+                    )
+                except Exception:
+                    pass
+        vals = {"X": gx, "Y": gy, "Z": gz}
+        for lcd, ax in self._mt102_field_gauss_lcds:
+            val = vals[ax]
+            lcd.setDigitCount(9)
+            lcd.setMode(QLCDNumber.Mode.Dec)
+            if have_g:
+                lcd.display("%.3f" % val)
+                color = self._mag_lcd_color_gauss(
+                    val, self._mt102_gauss_green, self._mt102_gauss_amber
+                )
+            else:
+                lcd.display("---")
+                color = _MEAS_LCD_NO_DATA
+            lcd.setStyleSheet(
+                "background-color: %s; color: %s;" % (MT102_LCD_BG, color)
+            )
+        te = self._win.findChild(QTextEdit, "textEdit_MT102_Data")
+        if not te and hasattr(self._win, "centralWidget"):
+            cw = self._win.centralWidget()
+            if cw:
+                te = cw.findChild(QTextEdit, "textEdit_MT102_Data")
+        if te:
+            txt = te.toPlainText()
+            wide = self._debug_level == _MT102_TRACE_DEBUG_MIN
+            hdr = (
+                "coilVx  coilVy  coilVz   RAW_X   RAW_Y   RAW_Z      G_X      G_Y      G_Z\n"
+                if wide
+                else "RAW          X        Y        Z\n"
+            )
+            if not txt.strip() or txt.strip().startswith("RX:"):
+                te.setPlainText(hdr)
+            lines = te.toPlainText().splitlines()
+            if len(lines) >= MT102_DATA_MONITOR_MAX_LINES:
+                cur = te.textCursor()
+                cur.beginEditBlock()
+                cur.movePosition(QTextCursor.MoveOperation.Start)
+                if lines and ("RAW" in lines[0] or "coilVx" in lines[0]):
+                    cur.movePosition(QTextCursor.MoveOperation.NextBlock)
+                cur.movePosition(
+                    QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor
+                )
+                cur.removeSelectedText()
+                cur.endEditBlock()
+            if wide:
+                vx, vy, vz = self._coil_v_xyz_from_last_tm()
+
+                def _cell_coil_v(v: float | None) -> str:
+                    return "%7.3f" % v if v is not None else "%7s" % "-"
+
+                if have_g:
+                    line = "%s %s %s %7d %7d %7d %8.4f %8.4f %8.4f\n" % (
+                        _cell_coil_v(vx),
+                        _cell_coil_v(vy),
+                        _cell_coil_v(vz),
+                        mag.x,
+                        mag.y,
+                        mag.z,
+                        gx,
+                        gy,
+                        gz,
+                    )
+                else:
+                    line = (
+                        "%s %s %s %7d %7d %7d %8s %8s %8s\n"
+                        % (
+                            _cell_coil_v(vx),
+                            _cell_coil_v(vy),
+                            _cell_coil_v(vz),
+                            mag.x,
+                            mag.y,
+                            mag.z,
+                            "---",
+                            "---",
+                            "---",
+                        )
+                    )
+            else:
+                raw_hex = "0x%04X" % (mag.x & 0xFFFF)
+                if have_g:
+                    line = "%-10s %8.3f %8.3f %8.3f\n" % (raw_hex, gx, gy, gz)
+                else:
+                    line = "%-10s %8s %8s %8s\n" % (raw_hex, "---", "---", "---")
+            cur = te.textCursor()
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            te.setTextCursor(cur)
+            te.insertPlainText(line)
+            sb = te.verticalScrollBar()
+            if sb:
+                sb.setValue(sb.maximum())
+        decl = float(self._mag_declination_deg)
+        # 3D pose uses the same factory F-cal B vector as the Gauss LCDs (never raw counts).
+        vd = getattr(self, "_viewer3d", None)
+        if have_g:
+            rx, ry, rz = self._field_vector_to_rotation(gx, gy, gz, decl)
+            if vd is not None and hasattr(vd, "set_rotation_immediate"):
+                try:
+                    vd.set_rotation_immediate(rx, ry, rz)
+                except Exception:
+                    pass
+            for lcd_name, deg in (
+                ("lcdNumber_Mt102_X", ry),
+                ("lcdNumber_MT102_Y", rx),
+                ("lcdNumber_MT102_Z", rz),
+            ):
+                lcd = self._find_lcd_number(self._win, lcd_name)
+                if lcd:
+                    lcd.setDigitCount(7)
+                    lcd.setMode(QLCDNumber.Mode.Dec)
+                    lcd.display("%.1f" % deg)
+        else:
+            for lcd_name in (
+                "lcdNumber_Mt102_X",
+                "lcdNumber_MT102_Y",
+                "lcdNumber_MT102_Z",
+            ):
+                lcd = self._find_lcd_number(self._win, lcd_name)
+                if lcd:
+                    lcd.setDigitCount(7)
+                    lcd.setMode(QLCDNumber.Mode.Dec)
+                    lcd.display("---")
+        self._refresh_mt102_fcal_applied_led()
+
+    def _install_viewer3d(self) -> None:
+        """Embed PyVista viewer in frame_3DModelView after the main window is shown."""
+        if getattr(self, "_viewer3d", None) is not None:
+            return
+        frame_3d = self._win.findChild(QFrame, "frame_3DModelView")
+        if frame_3d is None:
+            return
+        if Viewer3D is None:
+            layout = frame_3d.layout()
+            if layout is None:
+                layout = QVBoxLayout(frame_3d)
+            layout.addWidget(
+                QLabel(
+                    "3D viewer requires pyvista and pyvistaqt.\n"
+                    "Install: pip install pyvista pyvistaqt"
+                )
+            )
+            return
+        frame_3d.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        frame_3d.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, False)
+        layout = frame_3d.layout()
+        if layout is None:
+            layout = QVBoxLayout(frame_3d)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._viewer3d = Viewer3D(frame_3d)
+        layout.addWidget(self._viewer3d)
+        self._viewer3d.set_rotation(0, 0, 0)
+
     def _set_connected_ui(self, connected: bool) -> None:
         if connected:
-            self._btn_connect.setText("Disconnect")
+            self._btn_connect.setText("Disconnect all")
             self._refresh_connection_status_line()
             self._combo_port.setEnabled(False)
             self._combo_baud.setEnabled(False)
         else:
-            self._btn_connect.setText("Connect")
+            self._btn_connect.setText("Connect all")
             self._status_conn.setText("Connection: Disconnected")
             self._combo_port.setEnabled(True)
             self._combo_baud.setEnabled(True)
@@ -2275,8 +3328,9 @@ class CalibratorController:
         self._last_alive_reply_ts = None
         self._serial_saw_tm_txt_this_link = False
         self._keepalive_stale_dbg_done = False
-        self._tm_dbg_first_tm_after_connect = self._debug_level >= 2
-        self._tm_dbg_setx_absent_x_present_pending = self._debug_level >= 2
+        self._tm_dbg_first_tm_after_connect = self._debug_level == _TM_CSV_DEBUG_MIN
+        self._tm_dbg_setx_absent_x_present_pending = self._debug_level == _TM_CSV_DEBUG_MIN
+        self._last_tm_kv = None
         self._connect_mono_ts = None  # set when RX timer starts (after settle), not at USB open
         self._save_serial_ini()
         self._rx_buf.clear()
@@ -2326,6 +3380,7 @@ class CalibratorController:
         # Boot TXT:: is emitted once at Pico start; if we did not soft-reset, that stream was missed.
         if not self._soft_reset_on_connect_pref():
             QTimer.singleShot(280, self._request_hw_report_after_connect)
+        self._connect_mt102_after_pico()
 
     def _send_axis_enables_to_pico(self) -> None:
         """After connect: push set_*_v from Test V spinboxes (when present), then enable_X/Y/Z.
@@ -2469,6 +3524,7 @@ class CalibratorController:
 
     def _disconnect(self) -> None:
         self._dbg(1, "disconnect: stopping timers and closing serial")
+        self._disconnect_mt102_only()
         self._connect_rx_pump_slices = 0
         self._connect_mono_ts = None
         self._last_alive_reply_ts = None
@@ -2477,6 +3533,8 @@ class CalibratorController:
         self._keepalive_stale_dbg_done = False
         self._tm_dbg_first_tm_after_connect = False
         self._tm_dbg_setx_absent_x_present_pending = False
+        self._last_tm_kv = None
+        self._close_mag_test_xlsx()
         self._serial_timer.stop()
         self._rx_buf.clear()
         if self._serial is not None:
@@ -2512,8 +3570,8 @@ class CalibratorController:
         self._reset_measured_lcds_no_data()
 
     def shutdown(self) -> None:
+        """App exit: `_disconnect` already persists serial keys to ini."""
         self._disconnect()
-        self._save_serial_ini()
 
 
 def main() -> int:
@@ -2531,6 +3589,7 @@ def main() -> int:
 
     app.aboutToQuit.connect(ctrl.shutdown)
     win.show()
+    QTimer.singleShot(0, ctrl._install_viewer3d)
     return app.exec()
 
 
