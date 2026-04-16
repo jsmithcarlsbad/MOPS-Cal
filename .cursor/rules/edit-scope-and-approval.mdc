@@ -1,0 +1,37 @@
+---
+description: No scope creep; no mock code; protected firmware/GUI files; ask before broad or ambiguous edits.
+alwaysApply: true
+---
+
+# Edit scope and user approval (CoilDriver)
+
+## Scope
+
+- Change **only** what the user explicitly asked for in the **current** message (named files, named behavior). Do **not** add drive-by refactors, “improvements,” or extra features they did not request.
+- If the request is ambiguous, **ask one short clarifying question** or **outline the exact files/lines you would change** and wait for confirmation before editing.
+
+## No mock code — forbidden
+
+- **Do not** add or suggest **mocks**, **fakes**, **stubs**, **dummies**, **placeholders**, or **TODO scaffold** implementations “for later” — anywhere in the project (tests, scripts, firmware, host app, docs-as-code).
+- **Do not** use test doubles (e.g. `unittest.mock`, `MagicMock`, `patch`, in-memory fake hardware, simulated serial/devices).
+- Prefer **real integrations**, **hardware-in-the-loop**, or **omitting** a feature until it can be implemented for real.
+- If something cannot be built without a stand-in, **stop and ask the user** instead of adding mock code.
+
+## Protected files (no edits unless the user names the file and the change)
+
+- `Software/HostApp/CalibratorUI.py`
+- `Software/Pico/coil_driver_app.py`
+- `Software/Pico/main.py`
+- `DEPLOY/coil_driver_app.py`
+- `DEPLOY/main.py`
+
+(Also respect the separate rule: **never** edit `Software/HostApp/CalibratorUI.ui`.)
+
+## New or ancillary files
+
+- Do **not** create new scripts, configs, or docs unless the user asked for them.
+
+## Multi-file or behavioral changes
+
+- If a fix could touch firmware **and** host, **do not** change firmware unless the user explicitly approves firmware changes.
+- Prefer the **smallest** diff that satisfies the stated request.

@@ -1,0 +1,18 @@
+* rc_smoke.cir — minimal transient (pulse into R||C) to verify NGSpice batch.
+* Analogous to one axis: switched node -> series R -> shunt to GND with C load (values illustrative only).
+.title Calibrator coil-driver smoke — RC node
+
+vin in 0 pulse(0 12 0 0.1u 0.1u 50u 120u)
+rin in mid 200
+c1 mid 0 100u
+
+.tran 0.2u 150u
+
+.control
+run
+* wrdata: first column is simulation time; second is v(mid)
+wrdata rc_smoke_out.txt v(mid)
+echo Wrote rc_smoke_out.txt in the simulation directory.
+.endc
+
+.end

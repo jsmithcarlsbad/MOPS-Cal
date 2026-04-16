@@ -1,0 +1,10 @@
+---
+description: Only the user may edit CalibratorUI.ui; the agent must not change it.
+alwaysApply: true
+---
+
+# CalibratorUI.ui — user-only edits
+
+- **Never** create, delete, or modify `Software/HostApp/CalibratorUI.ui` (or any copy such as `CalibratorUI.ui-OLD`). Only the user edits Qt Designer / `.ui` sources.
+- UI changes the user wants must be described for them to apply in Designer, or implemented **only** in Python (`CalibratorUI.py`): `findChild`, new widgets created in code, `QUiLoader` workarounds, menu actions added programmatically, etc.
+- When new widgets or `objectName`s are required, **tell the user** what to add in the `.ui`; do not edit the file yourself.

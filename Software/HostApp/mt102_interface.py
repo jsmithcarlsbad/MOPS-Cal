@@ -27,6 +27,7 @@ from CalibratorUI.ini (tune against a traceable Gaussmeter).
 Uses a worker thread for non-blocking reads. ``QUE`` triggers ``Q`` + version + ``F`` flash.
 """
 
+import datetime
 import math
 import re
 import threading
@@ -291,6 +292,8 @@ class MT102Interface:
         self._lock = threading.Lock()
         self._latest: MagData | None = None
         self._cal_data: FlashCalData | None = None
+        #: ASCII hex payload (384 chars) from last parsed ``F`` line — for ``F_BLOCK_CAPTURE.md``.
+        self._f_payload_hex: str | None = None
         # Diagnostic counters for troubleshooting "no data"
         self._bytes_received = 0
         self._m_packets_parsed = 0
@@ -342,6 +345,7 @@ class MT102Interface:
         with self._lock:
             self._latest = None
             self._cal_data = None
+            self._f_payload_hex = None
         self._bytes_received = 0
         self._m_packets_parsed = 0
         self._f_packets_parsed = 0
@@ -361,6 +365,60 @@ class MT102Interface:
         """Return calibration from last F packet (after QUE). None if not yet received."""
         with self._lock:
             return self._cal_data
+
+    def build_f_block_capture_markdown(self) -> str | None:
+        """Markdown documenting the last captured F payload + parsed matrix/offsets (host bench artifact)."""
+        with self._lock:
+            cal = self._cal_data
+            payload = self._f_payload_hex
+            n_f = self._f_packets_parsed
+        if cal is None or payload is None or len(payload) < 384:
+            return None
+        s = cal.scale_matrix
+        ox, oy, oz = cal.offsets
+        yx, yy, yz_ = s[1][0], s[1][1], s[1][2]
+        cross_y = abs(yx) + abs(yz_)
+        lines = [
+            "# MT-102 F-block capture",
+            "",
+            "Parsed from the last valid `F` line after `QUE` (factory flash cal). "
+            "See `mt102_interface.FlashCalData` / `MagnetometerParser.cpp` case `'M'`.",
+            "",
+            f"- **Captured (host local time):** {datetime.datetime.now().isoformat(timespec='seconds')}",
+            f"- **F packets parsed (this session):** {n_f}",
+            f"- **Serial (from F block):** {cal.serial_number}",
+            "",
+            "## Offsets (added to raw M counts as Int16 before soft-iron subtraction)",
+            "",
+            "| Axis | Value |",
+            "|------|-------|",
+            f"| X | {ox} |",
+            f"| Y | {oy} |",
+            f"| Z | {oz} |",
+            "",
+            "## Soft-iron matrix (stored /1000 in flash; used as below with `MAG_SF_UC = 0.01`)",
+            "",
+            "Corrected Int16 counts: each axis subtracts `0.01 * (row · [x,y,z])` using **offset** x,y,z.",
+            "",
+            "| | col (× x) | col (× y) | col (× z) |",
+            "|---|-------------|-------------|-------------|",
+            f"| **X row** | {s[0][0]:.6g} | {s[0][1]:.6g} | {s[0][2]:.6g} |",
+            f"| **Y row** | {yx:.6g} | {yy:.6g} | {yz_:.6g} |",
+            f"| **Z row** | {s[2][0]:.6g} | {s[2][1]:.6g} | {s[2][2]:.6g} |",
+            "",
+            "### Hint for “Y looks wrong” vs X/Z",
+            "",
+            f"- **|YX| + |YZ|** (cross terms into the Y correction) **= {cross_y:.6g}**; **|YY|** **= {abs(yy):.6g}**.",
+            "- If cross terms are large vs `YY`, factory soft-iron is **mixing X/Z into Y**; with legacy axis routing that can show up as odd **Y Gauss** sign/magnitude vs the other channels.",
+            "",
+            "## Raw F payload (384 ASCII hex chars = 192 bytes mag-cal prefix)",
+            "",
+            "```text",
+        ]
+        for i in range(0, 384, 64):
+            lines.append(payload[i : i + 64])
+        lines.extend(["```", ""])
+        return "\n".join(lines)
 
     def request_cal_data(self) -> bool:
         """Send QUE to request Q+F response. Cal data parsed from F packet."""
@@ -438,5 +496,6 @@ class MT102Interface:
                                 self._f_packets_parsed += 1
                                 with self._lock:
                                     self._cal_data = cal
+                                    self._f_payload_hex = data[:384]
                     except (ValueError, UnicodeDecodeError):
                         pass

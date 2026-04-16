@@ -9,12 +9,35 @@ Loads CalibratorUI_MOPS.ui from this directory. Settings in CalibratorUI.ini (UT
   **Site Calibration** only (not under Settings): top-level ``menuSite_Calibration`` from Designer gets
   ``MT-102 Gauss scale...`` and ``Align MT-102 scale to reference meter...`` (programmatic ``QAction``s).
   ``objectName`` may be on the menubar ``QAction`` or the ``QMenu`` — both are resolved.
-  Connect all (`pushButton_ConnectAll`): opens Pico serial first, then MT-102 from ini (dual COM + threaded reader);
-  disconnect closes MT-102 first, then Pico (host_disconnect). 3D view embeds after `show()` (PyVista/Qt).
+  Connect all (`pushButton_ConnectAll`): opens Pico serial first, then MT-102 from ini (dual COM + threaded reader),
+  then Wit HWT901 on ``[serial] wit901_port`` (default COM10) via ``wit901_mag_stream`` protocol in a **daemon thread**;
+  **Axis convention (mag + UI):** Honeywell mag axis **errata** is addressed on the MT-102 **PCB rework** (trace swap)
+  so **reworked** units report X/Y/Z in the same ordering sense as Wit901 (and a consistent world frame). The host does
+  **not** remap MT-102. Set ``[serial] mt102_swapped_xy`` to ``true``/``T``/``1`` when the connected MT-102 is **legacy**
+  (mag X/Y still swapped on the stream); the host then swaps Wit901 **Gauss** X/Y **after** conversion so ``W901_Gauss_*``
+  and Wit LCDs match that stream for plots. Use ``false``/``F``/``0`` for **reworked** MT-102 (correct axes, matches Wit901).
+  When the key is missing, ``load_ini`` seeds ``mt102_swapped_xy = F``. The GUI snapshots 901 Gauss on the **same timer pass** as
+  MT102 for ``MagTest.xlsx`` / ``AmbianReadings.xlsx`` rows.
+  Disconnect closes Wit901, then MT-102, then Pico (host_disconnect). 3D view embeds after `show()` (PyVista/Qt).
+  **External Drive** (optional ``checkBox_ExternalDrive``): bench mode — no Pico. Checking the box disconnects the Pico
+  if connected, opens MT-102 + Wit901 only, starts the same poll timer for real-time LCDs, disables Pico/coil/Test NULL
+  controls, and appends MT-102 + Wit901 samples to ``ExternalDrive.xlsx`` (coil V columns blank; ``bench_V_*`` /
+  ``bench_I_*`` columns for you to fill from the external supply). Unchecking disconnects sensors and restores normal UI.
   Optional ``radioButton_F_CalApplied`` (Designer): LED-style — **gray** only when MT-102 is not connected;
   **bright red** when connected but F-cal not loaded yet; **lime** when flash F-cal is present (``get_cal_data()``).
+  On first F-cal parse this session, the host writes ``F_BLOCK_CAPTURE.md`` (parsed offsets, 3×3 soft-iron matrix, raw 384-char payload).
   Optional MT-102 field Gauss LCDs (Designer): ``lcdNumber_Mt102_X_Gauss`` and/or ``lcdNumber_MT102_{X,Y,Z}_Gauss``
   (capital ``G``) or ``lcdNumber_MT102_*_gauss`` — host tries every spelling so one typo axis does not stay at 0.
+  Field Gauss (MT102 + Wit901) minimum size and font track **sensed attitude** LCDs
+  (``lcdNumber_Mt102_X`` / ``lcdNumber_MT102_Y`` / ``lcdNumber_MT102_Z``): same digit height class;
+  MT102 field Gauss uses 7 digit slots (like attitude); Wit901 uses 8 for a signed 4-decimal readout.
+  Wit901 field Gauss: use **three** ``QLCDNumber`` widgets named exactly ``lcdNumber_Wit901_X_Gauss``,
+  ``lcdNumber_Wit901_Y_Gauss``, ``lcdNumber_Wit901_Z_Gauss`` (host binds these first, then optional regex/label variants).
+  Updated each ``_mag_poll`` tick.
+  **Gauss (apples-to-apples):** Wit901 X/Y/Z use ``wit901_mag_stream.lsbs_to_gauss`` (Wit int16 → ±16 µT full scale,
+  then **G = µT / 100**). MT102 X/Y/Z Gauss use factory F-cal corrected counts × ``[mt102_display] mag_raw_to_gauss``.
+  Both paths are **Gauss** for LCDs, ``MagTest.xlsx``, and ``AmbianReadings.xlsx``; magnitude agreement still depends
+  on sensor position and soft iron. ``mt102_swapped_xy`` drives Wit901 Gauss X/Y remap vs legacy MT-102 (see above).
 
 Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
@@ -59,7 +82,11 @@ Serial line protocol (newline-terminated):
     2 = Set TX echo on voltage-override sends. 3 = MT102 connect / F-cal / skip-fail lines only.
     4 = TM CSV + TM/serial chunk trace (``serial read``, ``RX (unprefixed)``, ``TM_CSV``, ``TXT``, TM-diag).
     5 = MT102: ``MagTest.xlsx`` (timestamp, coil V, RAW; Gauss columns only after factory
-    F-cal loads). No DBG5 MT102 stdout stream. Requires ``openpyxl``.
+    F-cal loads; plus ``W901_Gauss_*`` (after ``mt102_swapped_xy``) and ``W901_Raw_Gauss_*`` (UART frame, no swap)
+    from Wit901 on the same poll). No DBG5 MT102 stdout stream. Requires ``openpyxl``.
+    6 = (unused; reserved.) Former DEBUG=6 hook removed — ambient bump capture uses ``AmbianReadings.xlsx``
+    from **Test NULL** checkbox (open-loop four-step sequence), not DEBUG-gated; rows include ``W901_Gauss_*`` and
+    ``W901_Raw_Gauss_*``.
 
   Run:
     pip install -r requirements.txt
@@ -80,13 +107,15 @@ import html
 import math
 import re
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QPixmap, QTextCursor
+from PySide6.QtGui import QAction, QFont, QPixmap, QTextCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -116,6 +145,11 @@ except ImportError:
     MT102Interface = None  # type: ignore[misc, assignment]
 
 try:
+    import wit901_mag_stream as _w9_pkg
+except ImportError:
+    _w9_pkg = None  # type: ignore[misc, assignment]
+
+try:
     from viewer3d import Viewer3D
 except ImportError:
     Viewer3D = None  # type: ignore[misc, assignment]
@@ -135,6 +169,14 @@ _MT102_TRACE_DEBUG_MIN = 5
 _TM_CSV_PATH = _HERE / "test_1.csv"
 _MAG_TEST_XLSX_PATH = _HERE / "MagTest.xlsx"
 _MAG_TEST_XLSX_SAVE_EVERY_N = 25
+# Test NULL checkbox: open-loop ambient / axis-bump capture (needs openpyxl).
+_AMBIAN_XLSX_PATH = _HERE / "AmbianReadings.xlsx"
+# External Drive mode (MT-102 + Wit901 only, no Pico): log sensor rows here for bench supply experiments.
+_EXTERNAL_DRIVE_XLSX_PATH = _HERE / "ExternalDrive.xlsx"
+_EXTERNAL_DRIVE_SAVE_EVERY_N = 25
+_TESTCAL_SETTLE_MS = 2500
+# First successful MT-102 F-cal on connect: raw payload + matrix written here (bench artifact).
+_F_BLOCK_CAPTURE_PATH = _HERE / "F_BLOCK_CAPTURE.md"
 # Project logo for Help → About (user asset); also accepts HostApp/3DHC_Logo.png as fallback.
 _HOST_ASSETS_DIR = _HERE.parent / "Host"
 _ABOUT_LOGO_NAME = "3DHC_Logo.png"
@@ -149,7 +191,7 @@ _MAX_CURRENT_MA_CHOICES = (20.0, 50.0, 80.0, 100.0, PICO_MAX_COIL_MA)
 # bump MAJOR only for incompatible protocol/UI changes. Git commit messages should cite this and
 # coil_driver_app.py VERSION as a tested pair.
 CALIBRATOR_UI_VERSION_MAJOR = 1
-CALIBRATOR_UI_VERSION_MINOR = 30
+CALIBRATOR_UI_VERSION_MINOR = 50
 CALIBRATOR_UI_VERSION = "%d.%d" % (CALIBRATOR_UI_VERSION_MAJOR, CALIBRATOR_UI_VERSION_MINOR)
 
 _HELP_ABOUT_TITLE = "About Calibrator"
@@ -212,12 +254,158 @@ MT102_DATA_MONITOR_MAX_LINES = 500
 MT102_LCD_BG = "black"
 MT102_AMBER = "#FFBF00"
 _DEFAULT_MT102_BAUD = 9600
+_DEFAULT_WIT901_PORT = "COM10"
+_DEFAULT_WIT901_BAUD = 9600
 
 
 class _Mt102ErrBridge(QObject):
     """Thread-safe: worker calls err.emit(msg); UI slot runs on the Qt GUI thread."""
 
     err = Signal(str)
+
+
+class Wit901MagReader:
+    """Threaded Wit UART reader (0x54 mag frames); UI correlates via get_latest_gauss() on the Qt thread."""
+
+    def __init__(self, on_error: Callable[[str], None]) -> None:
+        self._on_error = on_error
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ser: serial.Serial | None = None
+        self._lock = threading.Lock()
+        self._latest: tuple[float, float, float] | None = None
+
+    def get_latest_gauss(self) -> tuple[float, float, float] | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            return self._latest
+
+    def connect(self, port: str, baud: int, *, read_timeout: float = 0.25) -> bool:
+        if _w9_pkg is None:
+            self._on_error("wit901_mag_stream import failed")
+            return False
+        port = (port or "").strip()
+        if not port:
+            return False
+        self.disconnect()
+        self._stop.clear()
+        try:
+            self._ser = serial.Serial(
+                port=port,
+                baudrate=int(baud),
+                timeout=read_timeout,
+                write_timeout=2.0,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+            )
+        except Exception as e:
+            self._ser = None
+            self._on_error("open %s: %s" % (port, e))
+            return False
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        return True
+
+    def disconnect(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.5)
+        self._thread = None
+        ser = self._ser
+        self._ser = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        with self._lock:
+            self._latest = None
+
+    def _apply_frames(self, buf: bytearray) -> None:
+        if _w9_pkg is None:
+            return
+        for frame in _w9_pkg.pop_wit_packets(buf):
+            if frame[1] != _w9_pkg.FRAME_MAG:
+                continue
+            hx, hy, hz = _w9_pkg.parse_mag_frame(frame)
+            x = _w9_pkg.lsbs_to_gauss(hx)
+            y = _w9_pkg.lsbs_to_gauss(hy)
+            z = _w9_pkg.lsbs_to_gauss(hz)
+            if self._stop.is_set():
+                return
+            with self._lock:
+                self._latest = (x, y, z)
+
+    def _worker(self) -> None:
+        ser = self._ser
+        if ser is None or _w9_pkg is None:
+            return
+        rx_grace_ms = 750.0
+        reg_hx = int(getattr(_w9_pkg, "_REG_HX", 0x3A))
+        buf = bytearray()
+        try:
+            try:
+                _w9_pkg.wit_init_stream(ser, flush_rx=False)
+            except Exception as e:
+                self._on_error("init failed: %s" % (e,))
+                return
+            try:
+                grace0 = _w9_pkg.capture_rx_window(ser, max(rx_grace_ms, 400.0))
+            except Exception as e:
+                self._on_error("rx: %s" % (e,))
+                return
+            if grace0:
+                buf.extend(grace0)
+                self._apply_frames(buf)
+            poll_s = 1.0
+            last_poll = time.monotonic() - poll_s
+            while not self._stop.is_set():
+                now = time.monotonic()
+                pieces: list[bytes] = []
+                polled = False
+                if poll_s > 0 and (now - last_poll) >= poll_s:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        _w9_pkg.wit_read_block(ser, reg_hx)
+                    except Exception as e:
+                        self._on_error("poll write: %s" % (e,))
+                        break
+                    last_poll = now
+                    polled = True
+                    try:
+                        grace_p = _w9_pkg.capture_rx_window(ser, rx_grace_ms)
+                    except Exception as e:
+                        self._on_error("poll rx: %s" % (e,))
+                        break
+                    if grace_p:
+                        pieces.append(grace_p)
+                if not polled and not self._stop.is_set():
+                    try:
+                        chunk = _w9_pkg.read_serial_chunk(ser, max_block=512)
+                    except Exception as e:
+                        self._on_error("read: %s" % (e,))
+                        break
+                    if chunk:
+                        pieces.append(chunk)
+                if polled and not self._stop.is_set():
+                    try:
+                        extra = _w9_pkg.read_serial_chunk(ser, max_block=512)
+                    except Exception as e:
+                        self._on_error("read: %s" % (e,))
+                        break
+                    if extra:
+                        pieces.append(extra)
+                for raw in pieces:
+                    buf.extend(raw)
+                    self._apply_frames(buf)
+                if not pieces:
+                    time.sleep(0.02)
+        finally:
+            pass
 
 
 def _helmholtz_pair_axis_center_gauss(
@@ -327,6 +515,26 @@ def enumerate_com_ports() -> list[str]:
     return sorted(set(out), key=_com_key)
 
 
+def _serial_mt102_swapped_xy(cp: configparser.ConfigParser) -> bool:
+    """True when MT-102 mag X/Y on the stream are still the legacy (pre-rework) swap — Wit901 Gauss X/Y is then swapped for alignment.
+
+    Reads ``[serial] mt102_swapped_xy`` (``true``/``false``, ``T``/``F``, ``1``/``0``, ``yes``/``no``, etc.).
+    If the option is missing, returns ``False`` (reworked / no swap).
+    """
+    if not cp.has_section("serial") or not cp.has_option("serial", "mt102_swapped_xy"):
+        return False
+    raw = cp.get("serial", "mt102_swapped_xy").strip()
+    u = raw.upper()
+    if u in ("1", "TRUE", "YES", "ON", "Y", "T"):
+        return True
+    if u in ("0", "FALSE", "NO", "OFF", "N", "F"):
+        return False
+    try:
+        return cp.getboolean("serial", "mt102_swapped_xy")
+    except ValueError:
+        return False
+
+
 def load_ini() -> configparser.ConfigParser:
     cp = configparser.ConfigParser()
     if _INI_PATH.is_file():
@@ -371,6 +579,12 @@ def load_ini() -> configparser.ConfigParser:
         cp.set("serial", "rs232_port", "")
     if not cp.has_option("serial", "baud_rate"):
         cp.set("serial", "baud_rate", str(_DEFAULT_MT102_BAUD))
+    if not cp.has_option("serial", "wit901_port"):
+        cp.set("serial", "wit901_port", _DEFAULT_WIT901_PORT)
+    if not cp.has_option("serial", "wit901_baud"):
+        cp.set("serial", "wit901_baud", str(_DEFAULT_WIT901_BAUD))
+    if not cp.has_option("serial", "mt102_swapped_xy"):
+        cp.set("serial", "mt102_swapped_xy", "F")
     if not cp.has_section("mt102_limits"):
         cp.add_section("mt102_limits")
     for _opt, _val in (
@@ -400,26 +614,30 @@ def load_ini() -> configparser.ConfigParser:
                 save_ini(cp)
             except OSError:
                 pass
-    if not cp.has_section("null_servo"):
-        cp.add_section("null_servo")
-    for _nk, _nv in (
-        ("target_gauss", "0.57"),
-        ("v_abs_max", "12.0"),
-        ("v_step_max", "0.1"),
-        ("period_ms", "200"),
-        ("Kp", "0.12"),
-        ("Ki", "0.02"),
-        ("integrator_abs_max", "4.0"),
-        ("sign_x", "1"),
-        ("sign_y", "1"),
-        ("sign_z", "1"),
-    ):
-        if not cp.has_option("null_servo", _nk):
-            cp.set("null_servo", _nk, _nv)
     return cp
 
 
 def save_ini(cp: configparser.ConfigParser) -> None:
+    """Persist ``cp`` to CalibratorUI.ini.
+
+    Before writing, merge any (section, option) that exists on disk but is missing from ``cp``.
+    That way keys or whole sections added or edited while the app was running are not erased when
+    the host saves (Settings, disconnect serial, enable_*, Site Calibration, etc.).
+    In-memory values always win for keys the app already holds.
+    """
+    if _INI_PATH.is_file():
+        disk_cp = configparser.ConfigParser()
+        try:
+            disk_cp.read(_INI_PATH, encoding="utf-8")
+        except configparser.Error:
+            pass
+        else:
+            for sec in disk_cp.sections():
+                if not cp.has_section(sec):
+                    cp.add_section(sec)
+                for key, val in disk_cp.items(sec):
+                    if not cp.has_option(sec, key):
+                        cp.set(sec, key, val)
     with open(_INI_PATH, "w", encoding="utf-8", newline="\n") as f:
         cp.write(f)
 
@@ -564,7 +782,7 @@ class CalibratorController:
         self._debug_level = self._read_debug_level()
         try:
             sys.stderr.write(
-                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout DBG: exact N only; TM CSV file>=%d; MT102 MagTest.xlsx + wide UI DEBUG==%d)\n"
+                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout DBG: exact N only; TM CSV>=%d; MagTest.xlsx DEBUG==%d; AmbianReadings.xlsx on Test NULL run)\n"
                 % (
                     CALIBRATOR_UI_VERSION,
                     _INI_PATH,
@@ -587,6 +805,11 @@ class CalibratorController:
                 sys.stderr.write(
                     "[CalibratorUI] DEBUG=%d: MT102 wide data monitor; MagTest rows -> %s (needs openpyxl)\n"
                     % (_MT102_TRACE_DEBUG_MIN, _MAG_TEST_XLSX_PATH.resolve())
+                )
+            if self._debug_level >= 1:
+                sys.stderr.write(
+                    "[CalibratorUI] Test NULL (ambient 4-step) -> %s (needs openpyxl)\n"
+                    % (_AMBIAN_XLSX_PATH.resolve(),)
                 )
             sys.stderr.flush()
         except Exception:
@@ -621,6 +844,9 @@ class CalibratorController:
         self._viewer3d: QWidget | None = None
         self._mt102_err_bridge = _Mt102ErrBridge(win)
         self._mt102_err_bridge.err.connect(self._on_mt102_thread_error)
+        self._wit901_err_bridge = _Mt102ErrBridge(win)
+        self._wit901_err_bridge.err.connect(self._on_wit901_thread_error)
+        self._wit901 = Wit901MagReader(lambda m: self._wit901_err_bridge.err.emit(str(m)))
         self._mt102_raw_green = MT102_RAW_GREEN
         self._mt102_raw_amber = MT102_RAW_AMBER
         self._mt102_gauss_green = MT102_GAUSS_GREEN
@@ -639,34 +865,35 @@ class CalibratorController:
             except Exception:
                 pass
         self._dbg_mt102_f_cal_logged = False
+        self._mt102_f_block_md_written = False
         self._mt102_cal_que_mono: float = 0.0
         self._mt102_fcal_polls_without_cal = 0
         self._mt102_fcal_missing_logged = False
         # Populated on first MT-102 Gauss UI refresh: (QLCDNumber, "X"|"Y"|"Z") via objectName regex.
         self._mt102_field_gauss_lcds: list[tuple[QLCDNumber, str]] | None = None
+        # User-added Wit901 Gauss readouts: QLCDNumber and/or QLabel per axis.
+        self._wit901_field_gauss_lcds: list[tuple[QWidget, str]] | None = None
         self._mag_test_wb: object | None = None
         self._mag_test_ws: object | None = None
         self._mag_test_xlsx_row_count = 0
         self._mag_test_xlsx_missing_logged = False
-
-        self._null_servo_chk: QCheckBox | None = win.findChild(
-            QCheckBox, "checkBox_TestNull"
-        )
-        self._null_servo_active = False
-        self._null_servo_prev_override_checked = False
-        self._null_servo_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        self._null_servo_timer = QTimer(self._win)
-        self._null_servo_timer.timeout.connect(self._null_servo_tick)
-        self._null_servo_target_gauss = 0.57
-        self._null_servo_v_abs_max = 12.0
-        self._null_servo_v_step_max = 0.1
-        self._null_servo_period_ms = 200
-        self._null_servo_kp = 0.12
-        self._null_servo_ki = 0.02
-        self._null_servo_i_abs_max = 4.0
-        self._null_servo_sign = {"X": 1, "Y": 1, "Z": 1}
-        self._reload_null_servo_params()
+        self._ambian_wb: object | None = None
+        self._ambian_ws: object | None = None
+        self._ambian_missing_logged = False
+        self._external_drive_wb: object | None = None
+        self._external_drive_ws: object | None = None
+        self._external_drive_row_count = 0
+        self._external_drive_active = False
+        self._testcal_chk: QCheckBox | None = win.findChild(QCheckBox, "checkBox_TestNull")
+        self._testcal_active = False
+        self._testcal_prev_override_checked = False
+        self._testcal_after_apply_index = 0
+        self._testcal_vx = 0.0
+        self._testcal_vy = 0.0
+        self._testcal_vz = 0.0
+        self._testcal_timer = QTimer(self._win)
+        self._testcal_timer.setSingleShot(True)
+        self._testcal_timer.timeout.connect(self._testcal_on_settle)
 
         self._combo_port = win.findChild(QComboBox, "comboBox_CalibratorPort")
         self._combo_baud = win.findChild(QComboBox, "comboBox_CalbratorBaud")
@@ -914,6 +1141,16 @@ class CalibratorController:
         self._setup_site_calibration_menu()
 
         self._btn_connect.clicked.connect(self._on_connect_clicked)
+        self._chk_external_drive: QCheckBox | None = win.findChild(
+            QCheckBox, "checkBox_ExternalDrive"
+        )
+        if self._chk_external_drive is not None:
+            self._chk_external_drive.setToolTip(
+                "External Drive (bench): disconnects Pico and connects MT-102 + Wit901 only. "
+                "Power coils from an external supply; GUI shows MT-102 and Wit901 in real time and logs to "
+                "ExternalDrive.xlsx (bench V/I columns left blank for your notes). Uncheck to restore normal mode."
+            )
+            self._chk_external_drive.toggled.connect(self._on_external_drive_toggled)
         self._btn_safe.clicked.connect(self._on_safe_calibrator)
         self._btn_reset.clicked.connect(self._on_reset_calibrator)
         self._btn_clear_text.clicked.connect(self._on_clear_calibrator_text)
@@ -927,12 +1164,14 @@ class CalibratorController:
             self._master_coils_enable.stateChanged.connect(
                 self._on_master_coils_enable_changed
             )
-        if self._null_servo_chk is not None:
-            self._null_servo_chk.setToolTip(
-                "Test NULL: closed-loop coil set_V toward [null_servo] target_gauss on each MT-102 "
-                "Gauss axis (F-cal required). Supersedes voltage override UI; SAFE when unchecked."
+        if self._testcal_chk is not None:
+            self._testcal_chk.setToolTip(
+                "Test NULL (ambient capture): open-loop four steps — all set_*_v 0, then X-only, Y-only, Z-only "
+                "voltages from the Test V spinboxes. After each step waits %d ms, logs MT-102 Gauss/RAW to "
+                "%s (needs openpyxl). No closed-loop null. Supersedes voltage override while running; SAFE when unchecked."
+                % (_TESTCAL_SETTLE_MS, _AMBIAN_XLSX_PATH.name)
             )
-            self._null_servo_chk.stateChanged.connect(self._on_test_null_changed)
+            self._testcal_chk.stateChanged.connect(self._on_test_null_changed)
         for ax, _sp, pb, _lcd, chk in self._axis_rows:
             if pb is not None:
                 pb.clicked.connect(lambda checked=False, a=ax: self._on_set_axis_ma(a))
@@ -1237,7 +1476,6 @@ class CalibratorController:
         self._sync_soft_reset_menu_from_ini()
         self._reload_helmholtz_geometry()
         self._reload_mt102_ini_preferences()
-        self._reload_null_servo_params()
         self._set_status("Settings restored from CalibratorUI.ini.")
         self._dbg(1, "settings restore; DEBUG level now", self._debug_level)
 
@@ -2204,36 +2442,246 @@ class CalibratorController:
             self._set_status(f"{axis} set_*_v write failed: {e}")
 
     def _on_test_null_changed(self, _state: int = 0) -> None:
-        if self._null_servo_chk is None:
+        if self._testcal_chk is None:
             return
-        if self._null_servo_chk.isChecked():
-            self._null_servo_start()
+        if self._testcal_chk.isChecked():
+            self._testcal_start()
         else:
-            self._null_servo_stop(send_safe=True)
+            self._testcal_stop(send_safe=True)
 
-    def _null_servo_start(self) -> None:
-        """Arm Test NULL: F-cal Gauss → three SISO PI loops on set_*_v (see [null_servo])."""
-        if self._null_servo_chk is None:
+    def _testcal_apply_cmds(self, vx: float, vy: float, vz: float) -> None:
+        self._volt_ov_cmd_v = {"X": float(vx), "Y": float(vy), "Z": float(vz)}
+        for ax, v in (("X", vx), ("Y", vy), ("Z", vz)):
+            self._send_axis_set_v(ax, float(v))
+            sp = self._volt_override_spins.get(ax)
+            if sp is not None:
+                sp.blockSignals(True)
+                sp.setValue(float(v))
+                sp.blockSignals(False)
+
+    def _testcal_append_row(
+        self,
+        step_id: str,
+        cmd_vx: float,
+        cmd_vy: float,
+        cmd_vz: float,
+        mag: object,
+        gx: float,
+        gy: float,
+        gz: float,
+        w901_g: tuple[float, float, float] | None = None,
+        w901_g_raw: tuple[float, float, float] | None = None,
+    ) -> None:
+        ws = self._ambian_ws
+        wb = self._ambian_wb
+        if ws is None or wb is None:
+            return
+        kv = self._last_tm_kv if self._last_tm_kv else {}
+
+        def _fin(v: float | None) -> float | None:
+            if v is None or not math.isfinite(v):
+                return None
+            return float(v)
+
+        def _fin_g(v: float) -> float | None:
+            if not math.isfinite(v):
+                return None
+            return float(v)
+
+        def _fin_g3(
+            g: tuple[float, float, float] | None,
+        ) -> tuple[float | None, float | None, float | None]:
+            if g is None:
+                return (None, None, None)
+            a, b, c = g
+            return (_fin_g(float(a)), _fin_g(float(b)), _fin_g(float(c)))
+
+        w9x, w9y, w9z = _fin_g3(w901_g)
+        wrx, wry, wrz = _fin_g3(w901_g_raw)
+
+        def _tmf(k: str) -> float | None:
+            return _fin(CalibratorController._tm_float(kv, k))
+
+        def _tmi(k: str) -> int | None:
+            v = self._tm_int(kv, k)
+            return v if v is not None else None
+
+        b_mag = None
+        if all(math.isfinite(v) for v in (gx, gy, gz)):
+            b_mag = math.sqrt(float(gx) * float(gx) + float(gy) * float(gy) + float(gz) * float(gz))
+        mk = _tmi("meas_ok")
+        try:
+            ws.append(
+                [
+                    datetime.datetime.now(),
+                    step_id,
+                    float(cmd_vx),
+                    float(cmd_vy),
+                    float(cmd_vz),
+                    _fin_g(gx),
+                    _fin_g(gy),
+                    _fin_g(gz),
+                    _fin(b_mag),
+                    _tmf("coil_V_X"),
+                    _tmf("coil_V_Y"),
+                    _tmf("coil_V_Z"),
+                    _tmf("X_ma"),
+                    _tmf("Y_ma"),
+                    _tmf("Z_ma"),
+                    mk,
+                    int(getattr(mag, "x")),
+                    int(getattr(mag, "y")),
+                    int(getattr(mag, "z")),
+                    w9x,
+                    w9y,
+                    w9z,
+                    wrx,
+                    wry,
+                    wrz,
+                ]
+            )
+            wb.save(str(_AMBIAN_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx append failed: %s\n" % (e,))
+            except Exception:
+                pass
+            self._close_ambian_xlsx()
+
+    def _close_ambian_xlsx(self) -> None:
+        wb = self._ambian_wb
+        if wb is None:
+            return
+        try:
+            wb.save(str(_AMBIAN_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx save failed: %s\n" % (e,))
+            except Exception:
+                pass
+        self._ambian_wb = None
+        self._ambian_ws = None
+
+    def _ensure_ambian_xlsx_workbook(self, bump_vx: float, bump_vy: float, bump_vz: float) -> bool:
+        if _OpenpyxlWorkbook is None:
+            if not self._ambian_missing_logged:
+                self._ambian_missing_logged = True
+                try:
+                    sys.stderr.write(
+                        "[CalibratorUI] pip install openpyxl to write %s\n"
+                        % (_AMBIAN_XLSX_PATH.resolve(),)
+                    )
+                except Exception:
+                    pass
+            return False
+        self._close_ambian_xlsx()
+        try:
+            wb = _OpenpyxlWorkbook()
+            ws = wb.active
+            ws.title = "Steps"
+            ws.append(
+                [
+                    "timestamp",
+                    "step_id",
+                    "cmd_Vx",
+                    "cmd_Vy",
+                    "cmd_Vz",
+                    "Gx",
+                    "Gy",
+                    "Gz",
+                    "B_mag",
+                    "coil_V_X",
+                    "coil_V_Y",
+                    "coil_V_Z",
+                    "X_ma",
+                    "Y_ma",
+                    "Z_ma",
+                    "meas_ok",
+                    "RAW_X",
+                    "RAW_Y",
+                    "RAW_Z",
+                    "W901_Gauss_X",
+                    "W901_Gauss_Y",
+                    "W901_Gauss_Z",
+                    "W901_Raw_Gauss_X",
+                    "W901_Raw_Gauss_Y",
+                    "W901_Raw_Gauss_Z",
+                ]
+            )
+            wcfg = wb.create_sheet("Config")
+            wcfg.append(["key", "value"])
+            wcfg.append(["settle_ms", str(_TESTCAL_SETTLE_MS)])
+            wcfg.append(["bump_spin_Vx", str(bump_vx)])
+            wcfg.append(["bump_spin_Vy", str(bump_vy)])
+            wcfg.append(["bump_spin_Vz", str(bump_vz)])
+            wcfg.append(["mag_raw_to_gauss", str(self._mag_raw_to_gauss)])
+            wcfg.append(
+                [
+                    "wit901_port",
+                    self._ini.get("serial", "wit901_port", fallback=_DEFAULT_WIT901_PORT).strip(),
+                ]
+            )
+            wcfg.append(
+                [
+                    "wit901_baud",
+                    self._ini.get("serial", "wit901_baud", fallback=str(_DEFAULT_WIT901_BAUD)).strip(),
+                ]
+            )
+            wcfg.append(
+                [
+                    "wit901_gauss",
+                    "wit901_mag_stream lsbs_to_gauss: int16*(16/32768)µT/LSB, G=µT/100",
+                ]
+            )
+            wcfg.append(["CALIBRATOR_UI_VERSION", CALIBRATOR_UI_VERSION])
+            wcfg.append(
+                [
+                    "mt102_swapped_xy_effective",
+                    str(_serial_mt102_swapped_xy(self._ini)),
+                ]
+            )
+            wcfg.append(
+                [
+                    "W901_columns",
+                    "W901_Gauss_* = after mt102_swapped_xy; W901_Raw_Gauss_* = Wit UART frame (no swap)",
+                ]
+            )
+            self._ambian_wb = wb
+            self._ambian_ws = ws
+            wb.save(str(_AMBIAN_XLSX_PATH))
+        except Exception as e:
+            self._ambian_wb = None
+            self._ambian_ws = None
+            try:
+                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx init failed: %s\n" % (e,))
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _testcal_start(self) -> None:
+        """Open-loop four-step ambient / axis-bump capture → AmbianReadings.xlsx."""
+        if self._testcal_chk is None:
             return
         if self._serial is None:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: connect Pico serial first.")
             return
         if MT102Interface is None or self._mt102 is None:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: connect MT-102 (Connect all) first.")
             return
         try:
             if not self._mt102.is_connected():
                 raise RuntimeError("MT-102 not connected")
         except Exception:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: MT-102 not connected.")
             return
         cal = None
@@ -2243,52 +2691,45 @@ class CalibratorController:
         except Exception:
             cal = None
         if cal is None:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: wait for MT-102 factory F-cal (Gauss) before enabling.")
             return
         if len(self._volt_override_spins) != 3:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: need Test V spinboxes (doubleSpinBox_Test_X/Y/Z_V).")
             return
         if self._master_coils_enable is None:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
             self._set_status("Test NULL: need checkBox_TestVoltageSetting (master coil enable).")
             return
 
-        self._reload_null_servo_params()
-        mag = None
-        try:
-            mag = self._mt102.get_mag_data(timeout=0.05)
-        except Exception:
-            mag = None
-        if mag is None:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
-            self._set_status("Test NULL: no MT-102 sample yet — try again.")
+        spx = self._volt_override_spins.get("X")
+        spy = self._volt_override_spins.get("Y")
+        spz = self._volt_override_spins.get("Z")
+        if spx is None or spy is None or spz is None:
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
+            self._set_status("Test NULL: need Test V spinboxes.")
             return
-        try:
-            gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
-        except Exception:
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
-            self._set_status("Test NULL: Gauss conversion failed.")
-            return
-        if not all(math.isfinite(v) for v in (gx, gy, gz)):
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
-            self._set_status("Test NULL: MT-102 Gauss not finite (F-cal required).")
+        self._testcal_vx = max(0.0, float(spx.value()))
+        self._testcal_vy = max(0.0, float(spy.value()))
+        self._testcal_vz = max(0.0, float(spz.value()))
+
+        if not self._ensure_ambian_xlsx_workbook(self._testcal_vx, self._testcal_vy, self._testcal_vz):
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
+            self._set_status("Test NULL: openpyxl missing or AmbianReadings.xlsx could not be created.")
             return
 
-        self._null_servo_prev_override_checked = bool(
+        self._testcal_prev_override_checked = bool(
             self._volt_override_chk is not None and self._volt_override_chk.isChecked()
         )
         if self._volt_override_chk is not None:
@@ -2296,16 +2737,6 @@ class CalibratorController:
             self._volt_override_chk.setChecked(True)
             self._volt_override_chk.blockSignals(False)
             self._volt_override_chk.setEnabled(False)
-        self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        for ax in ("X", "Y", "Z"):
-            self._null_servo_v[ax] = 0.0
-            self._send_axis_set_v(ax, 0.0)
-            sp = self._volt_override_spins.get(ax)
-            if sp is not None:
-                sp.blockSignals(True)
-                sp.setValue(0.0)
-                sp.setEnabled(False)
-                sp.blockSignals(False)
 
         self._master_coils_enable.blockSignals(True)
         self._master_coils_enable.setChecked(True)
@@ -2316,60 +2747,24 @@ class CalibratorController:
         for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
             if chk is not None:
                 chk.setEnabled(False)
+        for sp in self._volt_override_spins.values():
+            sp.setEnabled(False)
 
-        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        self._null_servo_active = True
-        self._null_servo_timer.start()
-        self._dbg(1, "Test NULL: started; target_gauss=", self._null_servo_target_gauss)
+        self._testcal_active = True
+        self._testcal_after_apply_index = 0
+        self._testcal_apply_cmds(0.0, 0.0, 0.0)
         self._set_status(
-            "Test NULL: servo running toward %.3f G on each axis (INI [null_servo])."
-            % (self._null_servo_target_gauss,)
+            "Test NULL: ambient 4-step run (settle %d ms per step) → %s"
+            % (_TESTCAL_SETTLE_MS, _AMBIAN_XLSX_PATH.name)
         )
+        self._dbg(1, "Test NULL: ambient capture started", _AMBIAN_XLSX_PATH.resolve())
+        self._testcal_timer.start(_TESTCAL_SETTLE_MS)
 
-    def _null_servo_stop(self, send_safe: bool = True) -> None:
-        """Exit Test NULL: re-enable widgets; optional SAFE (coils off)."""
-        self._null_servo_timer.stop()
-        was_active = self._null_servo_active
-        self._null_servo_active = False
-        self._null_servo_i = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-
-        if self._volt_override_spins:
-            for sp in self._volt_override_spins.values():
-                sp.setEnabled(True)
-        if self._volt_override_chk is not None:
-            self._volt_override_chk.setEnabled(True)
-            self._volt_override_chk.blockSignals(True)
-            self._volt_override_chk.setChecked(self._null_servo_prev_override_checked)
-            self._volt_override_chk.blockSignals(False)
-        if self._master_coils_enable is not None:
-            self._master_coils_enable.setEnabled(True)
-        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
-            if chk is not None:
-                chk.setEnabled(True)
-
-        if self._null_servo_chk is not None and self._null_servo_chk.isChecked():
-            self._null_servo_chk.blockSignals(True)
-            self._null_servo_chk.setChecked(False)
-            self._null_servo_chk.blockSignals(False)
-
-        if send_safe and was_active and self._serial is not None:
-            try:
-                self._dbg(1, "Test NULL: stop → SAFE")
-                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-                self._serial.write(b"safe\r\n")
-                self._serial.flush()
-                self._set_status("Test NULL off — SAFE sent (coils off).")
-            except Exception as e:
-                self._set_status(f"Test NULL stop: SAFE failed: {e}")
-        elif was_active:
-            self._set_status("Test NULL off.")
-
-    def _null_servo_tick(self) -> None:
-        if not self._null_servo_active:
+    def _testcal_on_settle(self) -> None:
+        if not self._testcal_active:
             return
         if self._serial is None or MT102Interface is None or self._mt102 is None:
-            self._null_servo_stop(send_safe=False)
+            self._testcal_stop(send_safe=False)
             return
         cal = None
         try:
@@ -2378,48 +2773,142 @@ class CalibratorController:
         except Exception:
             cal = None
         if cal is None:
+            self._testcal_stop(send_safe=True)
             return
         try:
-            mag = self._mt102.get_mag_data(timeout=0)
+            mag = self._mt102.get_mag_data(timeout=0.1)
         except Exception:
-            return
+            mag = None
         if mag is None:
+            self._testcal_stop(send_safe=True)
+            self._set_status("Test NULL: lost MT-102 sample during run.")
             return
         try:
             gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
         except Exception:
+            self._testcal_stop(send_safe=True)
             return
         if not all(math.isfinite(v) for v in (gx, gy, gz)):
+            self._testcal_stop(send_safe=True)
             return
 
-        g_tgt = float(self._null_servo_target_gauss)
-        gvec = {"X": float(gx), "Y": float(gy), "Z": float(gz)}
-        dt = max(1e-3, self._null_servo_period_ms / 1000.0)
-        for ax in ("X", "Y", "Z"):
-            e = (g_tgt - gvec[ax]) * float(self._null_servo_sign[ax])
-            self._null_servo_i[ax] += e * dt
-            lim = self._null_servo_i_abs_max
-            self._null_servo_i[ax] = max(-lim, min(lim, self._null_servo_i[ax]))
-            du = self._null_servo_kp * e + self._null_servo_ki * self._null_servo_i[ax]
-            v = self._null_servo_v[ax] + du
-            v = max(0.0, min(self._null_servo_v_abs_max, v))
-            dv = v - self._null_servo_v[ax]
-            sm = self._null_servo_v_step_max
-            if abs(dv) > sm:
-                v = self._null_servo_v[ax] + math.copysign(sm, dv)
-            v = max(0.0, min(self._null_servo_v_abs_max, v))
-            self._null_servo_v[ax] = v
-            self._volt_ov_cmd_v[ax] = v
-            self._send_axis_set_v(ax, v)
-            sp = self._volt_override_spins.get(ax)
-            if sp is not None:
-                sp.blockSignals(True)
-                sp.setValue(v)
-                sp.blockSignals(False)
+        w901_raw, w901_g = self._snapshot_wit901_gauss_raw_and_display()
+
+        idx = self._testcal_after_apply_index
+        if idx == 0:
+            name, vx, vy, vz = "all_zero", 0.0, 0.0, 0.0
+        elif idx == 1:
+            name, vx, vy, vz = "Vx_only", self._testcal_vx, 0.0, 0.0
+        elif idx == 2:
+            name, vx, vy, vz = "Vy_only", 0.0, self._testcal_vy, 0.0
+        else:
+            name, vx, vy, vz = "Vz_only", 0.0, 0.0, self._testcal_vz
+        self._testcal_append_row(
+            name, vx, vy, vz, mag, gx, gy, gz, w901_g=w901_g, w901_g_raw=w901_raw
+        )
+
+        if idx >= 3:
+            self._testcal_finish(send_safe=True)
+            return
+
+        if idx == 0:
+            self._testcal_apply_cmds(self._testcal_vx, 0.0, 0.0)
+            self._testcal_after_apply_index = 1
+        elif idx == 1:
+            self._testcal_apply_cmds(0.0, self._testcal_vy, 0.0)
+            self._testcal_after_apply_index = 2
+        else:
+            self._testcal_apply_cmds(0.0, 0.0, self._testcal_vz)
+            self._testcal_after_apply_index = 3
+        self._testcal_timer.start(_TESTCAL_SETTLE_MS)
+
+    def _sync_master_coils_ui_off_after_testcal_safe(self) -> None:
+        """After Test NULL sends SAFE, Pico coils are off; match the master checkbox so the UI is not 'on' while idle."""
+        if self._master_coils_enable is None or self._serial is None:
+            return
+        self._master_coils_enable.blockSignals(True)
+        self._master_coils_enable.setChecked(False)
+        self._master_coils_enable.blockSignals(False)
+        self._on_master_coils_enable_changed(0)
+
+    def _testcal_finish(self, send_safe: bool = True) -> None:
+        self._testcal_timer.stop()
+        was = self._testcal_active
+        self._testcal_active = False
+        self._testcal_apply_cmds(0.0, 0.0, 0.0)
+        self._close_ambian_xlsx()
+        if self._volt_override_spins:
+            for sp in self._volt_override_spins.values():
+                sp.setEnabled(True)
+        if self._volt_override_chk is not None:
+            self._volt_override_chk.setEnabled(True)
+            self._volt_override_chk.blockSignals(True)
+            self._volt_override_chk.setChecked(self._testcal_prev_override_checked)
+            self._volt_override_chk.blockSignals(False)
+        if self._master_coils_enable is not None:
+            self._master_coils_enable.setEnabled(True)
+        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
+            if chk is not None:
+                chk.setEnabled(True)
+        if self._testcal_chk is not None and self._testcal_chk.isChecked():
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
+        if send_safe and was and self._serial is not None:
+            try:
+                self._dbg(1, "Test NULL: ambient capture done → SAFE")
+                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
+                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+                self._serial.write(b"safe\r\n")
+                self._serial.flush()
+                self._sync_master_coils_ui_off_after_testcal_safe()
+                self._set_status("Test NULL: done — %s saved; SAFE sent." % _AMBIAN_XLSX_PATH.name)
+            except Exception as e:
+                self._set_status("Test NULL: SAFE failed: %s" % (e,))
+        elif was:
+            self._set_status("Test NULL: done — %s saved." % _AMBIAN_XLSX_PATH.name)
+
+    def _testcal_stop(self, send_safe: bool = True) -> None:
+        """User unchecked Test NULL or abort: stop timer, optional SAFE."""
+        self._testcal_timer.stop()
+        was = self._testcal_active
+        self._testcal_active = False
+        self._testcal_apply_cmds(0.0, 0.0, 0.0)
+        self._close_ambian_xlsx()
+        if self._volt_override_spins:
+            for sp in self._volt_override_spins.values():
+                sp.setEnabled(True)
+        if self._volt_override_chk is not None:
+            self._volt_override_chk.setEnabled(True)
+            self._volt_override_chk.blockSignals(True)
+            self._volt_override_chk.setChecked(self._testcal_prev_override_checked)
+            self._volt_override_chk.blockSignals(False)
+        if self._master_coils_enable is not None:
+            self._master_coils_enable.setEnabled(True)
+        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
+            if chk is not None:
+                chk.setEnabled(True)
+        if self._testcal_chk is not None and self._testcal_chk.isChecked():
+            self._testcal_chk.blockSignals(True)
+            self._testcal_chk.setChecked(False)
+            self._testcal_chk.blockSignals(False)
+        if send_safe and was and self._serial is not None:
+            try:
+                self._dbg(1, "Test NULL: abort → SAFE")
+                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
+                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+                self._serial.write(b"safe\r\n")
+                self._serial.flush()
+                self._sync_master_coils_ui_off_after_testcal_safe()
+                self._set_status("Test NULL off — SAFE sent (coils off).")
+            except Exception as e:
+                self._set_status("Test NULL stop: SAFE failed: %s" % (e,))
+        elif was:
+            self._set_status("Test NULL off.")
 
     def _volt_override_pwm_adjust(self, kv: dict[str, str]) -> None:
         """Nudge set_<axis>_v using TM:: coil_V_* vs doubleSpinBox_Test_*_V (Pico 5.x voltage mode)."""
-        if self._null_servo_active:
+        if self._testcal_active:
             return
         if self._volt_override_chk is None or not self._volt_override_chk.isChecked():
             return
@@ -2515,10 +3004,10 @@ class CalibratorController:
         if self._serial is None:
             self._set_status("Not connected.")
             return
-        if self._null_servo_active or (
-            self._null_servo_chk is not None and self._null_servo_chk.isChecked()
+        if self._testcal_active or (
+            self._testcal_chk is not None and self._testcal_chk.isChecked()
         ):
-            self._null_servo_stop(send_safe=False)
+            self._testcal_stop(send_safe=False)
         try:
             self._dbg(1, "action: SAFE (safe)")
             if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
@@ -2939,39 +3428,12 @@ class CalibratorController:
             except ValueError:
                 self._mag_declination_deg = 0.0
 
-    def _reload_null_servo_params(self) -> None:
-        """[null_servo] from CalibratorUI.ini — see load_ini defaults."""
-        ini = self._ini
-        sec = "null_servo"
-        if not ini.has_section(sec):
-            return
-
-        def _fopt(key: str, default: float) -> float:
-            try:
-                return float(ini.get(sec, key, fallback=str(default)).strip())
-            except ValueError:
-                return default
-
-        def _iopt(key: str, default: int) -> int:
-            try:
-                return int(round(float(ini.get(sec, key, fallback=str(default)).strip())))
-            except ValueError:
-                return default
-
-        self._null_servo_target_gauss = _fopt("target_gauss", 0.57)
-        self._null_servo_v_abs_max = max(0.1, _fopt("v_abs_max", 12.0))
-        self._null_servo_v_step_max = max(1e-6, _fopt("v_step_max", 0.1))
-        self._null_servo_period_ms = max(20, _iopt("period_ms", 200))
-        self._null_servo_kp = _fopt("Kp", 0.12)
-        self._null_servo_ki = _fopt("Ki", 0.02)
-        self._null_servo_i_abs_max = max(0.01, _fopt("integrator_abs_max", 4.0))
-        for ax in ("X", "Y", "Z"):
-            s = _iopt(f"sign_{ax.lower()}", 1)
-            self._null_servo_sign[ax] = -1 if s < 0 else 1
-        self._null_servo_timer.setInterval(self._null_servo_period_ms)
-
     def _on_mt102_thread_error(self, msg: str) -> None:
         self._set_status("MT-102: %s" % (msg,))
+
+    def _on_wit901_thread_error(self, msg: str) -> None:
+        self._set_status("Wit901: %s" % (msg,))
+        self._dbg(3, "Wit901:", msg)
 
     @staticmethod
     def _find_lcd_number(window: QMainWindow, object_name: str) -> QLCDNumber | None:
@@ -2985,9 +3447,80 @@ class CalibratorController:
                 return lcd
         return None
 
+    @staticmethod
+    def _find_label_widget(window: QMainWindow, object_name: str) -> QLabel | None:
+        lab = window.findChild(QLabel, object_name)
+        if lab is not None:
+            return lab
+        cw = window.centralWidget() if hasattr(window, "centralWidget") else None
+        if cw is not None:
+            lab = cw.findChild(QLabel, object_name)
+            if lab is not None:
+                return lab
+        return None
+
     _RE_MT102_FIELD_GAUSS_LCD = re.compile(
         r"^lcdNumber_(?:MT102|Mt102)_([XYZ])_(?:[Gg]auss)$"
     )
+    _RE_WIT901_FIELD_GAUSS_LCD = re.compile(
+        r"^lcdNumber_(?:Wit901|WIT901|WIT_901|wit901)_([XYZxyz])_(?:[Gg]auss)$"
+    )
+    _RE_WIT901_FIELD_GAUSS_LABEL = re.compile(
+        r"^label_(?:Wit901|WIT901|WIT_901|wit901)_([XYZxyz])_(?:[Gg]auss)$"
+    )
+    _WIT901_GAUSS_FALLBACK_LCD_NAMES: tuple[tuple[str, str], ...] = (
+        ("X", "lcdNumber_Wit901_X_Gauss"),
+        ("Y", "lcdNumber_Wit901_Y_Gauss"),
+        ("Z", "lcdNumber_Wit901_Z_Gauss"),
+    )
+    _WIT901_GAUSS_FALLBACK_LABEL_NAMES: tuple[tuple[str, str], ...] = (
+        ("X", "label_Wit901_X_Gauss"),
+        ("Y", "label_Wit901_Y_Gauss"),
+        ("Z", "label_Wit901_Z_Gauss"),
+    )
+    # Sensed attitude (degrees) — used as visual reference for field Gauss LCD numeral size.
+    _MT102_ATTITUDE_LCD_NAMES = (
+        "lcdNumber_Mt102_X",
+        "lcdNumber_MT102_Y",
+        "lcdNumber_MT102_Z",
+    )
+
+    def _reference_mt102_attitude_lcd(self) -> QLCDNumber | None:
+        for name in self._MT102_ATTITUDE_LCD_NAMES:
+            lcd = self._find_lcd_number(self._win, name)
+            if lcd is not None:
+                return lcd
+        return None
+
+    def _field_gauss_lcd_match_attitude_size(self, lcd: QLCDNumber, *, gauss_digit_count: int) -> None:
+        """Match segment size to sensed-attitude LCDs: same height; width ∝ digit slots vs attitude (7)."""
+        ref = self._reference_mt102_attitude_lcd()
+        if ref is None:
+            lcd.setMinimumSize(max(lcd.minimumWidth(), 160), max(lcd.minimumHeight(), 56))
+            return
+        ref_w = max(ref.minimumWidth(), ref.width(), ref.sizeHint().width())
+        ref_h = max(ref.minimumHeight(), ref.height(), ref.sizeHint().height())
+        att_digits = 7
+        nd = max(7, int(gauss_digit_count))
+        scale = float(nd) / float(att_digits)
+        target_w = int(max(ref_w * scale * 1.08, ref_w * scale + 16))
+        target_h = int(max(ref_h * 1.06, ref_h + 4))
+        lcd.setMinimumSize(max(lcd.minimumWidth(), target_w), max(lcd.minimumHeight(), target_h))
+        lcd.setFont(QFont(ref.font()))
+
+    def _field_gauss_label_match_attitude(self, lab: QLabel) -> None:
+        """Match QLabel readout font/height to sensed-attitude LCDs (segment size proxy)."""
+        ref = self._reference_mt102_attitude_lcd()
+        if ref is None:
+            lab.setMinimumHeight(max(lab.minimumHeight(), 48))
+            return
+        ref_h = max(ref.minimumHeight(), ref.height(), ref.sizeHint().height())
+        ref_w = max(ref.minimumWidth(), ref.width(), ref.sizeHint().width())
+        lab.setMinimumSize(
+            max(lab.minimumWidth(), int(ref_w * 1.05)),
+            max(lab.minimumHeight(), ref_h),
+        )
+        lab.setFont(QFont(ref.font()))
 
     def _discover_mt102_field_gauss_lcds(self) -> list[tuple[QLCDNumber, str]]:
         """Bind MT-102 *field* Gauss seven-segments by objectName (any Mt/MT + Gauss/gauss spelling)."""
@@ -3005,10 +3538,206 @@ class CalibratorController:
             lcd.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
             if hasattr(lcd, "setSmallDecimalPoint"):
                 lcd.setSmallDecimalPoint(True)
-            mw = max(lcd.minimumWidth(), 100)
-            mh = max(lcd.minimumHeight(), 40)
-            lcd.setMinimumSize(mw, mh)
+            self._field_gauss_lcd_match_attitude_size(lcd, gauss_digit_count=7)
         return out
+
+    def _discover_wit901_field_gauss_lcds(self) -> list[tuple[QWidget, str]]:
+        """Bind Wit901 Gauss readouts. Prefer exact ``lcdNumber_Wit901_[XYZ]_Gauss`` QLCDNumbers."""
+        by_ax: dict[str, QWidget] = {}
+        # 1) Exact Designer names (QLCDNumber only — avoids regex picking a wrong sibling first).
+        for ax, oname in self._WIT901_GAUSS_FALLBACK_LCD_NAMES:
+            lcd = self._find_lcd_number(self._win, oname)
+            if lcd is not None:
+                by_ax[ax] = lcd
+        # 2) Regex variants only for axes still missing
+        for lcd in self._win.findChildren(QLCDNumber):
+            oname = (lcd.objectName() or "").strip()
+            m = self._RE_WIT901_FIELD_GAUSS_LCD.match(oname)
+            if not m:
+                continue
+            ax = m.group(1).upper()
+            if ax not in by_ax:
+                by_ax[ax] = lcd
+        for lab in self._win.findChildren(QLabel):
+            oname = (lab.objectName() or "").strip()
+            m = self._RE_WIT901_FIELD_GAUSS_LABEL.match(oname)
+            if not m:
+                continue
+            ax = m.group(1).upper()
+            if ax not in by_ax:
+                by_ax[ax] = lab
+        for ax, oname in self._WIT901_GAUSS_FALLBACK_LABEL_NAMES:
+            if ax in by_ax:
+                continue
+            lab = self._find_label_widget(self._win, oname)
+            if lab is not None:
+                by_ax[ax] = lab
+        out: list[tuple[QWidget, str]] = []
+        for ax in ("X", "Y", "Z"):
+            w = by_ax.get(ax)
+            if w is None:
+                continue
+            if isinstance(w, QLCDNumber):
+                w.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
+                if hasattr(w, "setSmallDecimalPoint"):
+                    w.setSmallDecimalPoint(True)
+                self._field_gauss_lcd_match_attitude_size(w, gauss_digit_count=8)
+            elif isinstance(w, QLabel):
+                self._field_gauss_label_match_attitude(w)
+                w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            out.append((w, ax))
+        if len(out) != 3 and not getattr(self, "_wit901_field_gauss_disc_warned", False):
+            self._wit901_field_gauss_disc_warned = True
+            try:
+                hint_lcd = sorted(
+                    {
+                        (x.objectName() or "").strip()
+                        for x in self._win.findChildren(QLCDNumber)
+                        if (x.objectName() or "").strip()
+                        and (
+                            "901" in (x.objectName() or "").lower()
+                            or "wit" in (x.objectName() or "").lower()
+                        )
+                    }
+                )[:30]
+                hint_lab = sorted(
+                    {
+                        (x.objectName() or "").strip()
+                        for x in self._win.findChildren(QLabel)
+                        if (x.objectName() or "").strip()
+                        and (
+                            "901" in (x.objectName() or "").lower()
+                            or "wit" in (x.objectName() or "").lower()
+                        )
+                    }
+                )[:30]
+                sys.stderr.write(
+                    "[CalibratorUI] Wit901 Gauss: found %d widget(s) %s; expected 3. "
+                    "Use three QLCDNumber: lcdNumber_Wit901_X_Gauss, lcdNumber_Wit901_Y_Gauss, "
+                    "lcdNumber_Wit901_Z_Gauss (exact names). Optional: label_Wit901_*_Gauss QLabel. "
+                    "QLCDNumber hints: %s  QLabel hints: %s\n"
+                    % (
+                        len(out),
+                        [(w.objectName(), ax) for w, ax in out],
+                        hint_lcd or ["(none)"],
+                        hint_lab or ["(none)"],
+                    )
+                )
+            except Exception:
+                pass
+        return out
+
+    def _wit901_merge_missing_axis_lcds(self) -> None:
+        """If regex missed an axis, attach widgets by canonical ``objectName`` (same session)."""
+        cur = self._wit901_field_gauss_lcds
+        if cur is None:
+            return
+        have = {ax for _, ax in cur}
+        for ax, oname in self._WIT901_GAUSS_FALLBACK_LCD_NAMES:
+            if ax in have:
+                continue
+            lcd = self._find_lcd_number(self._win, oname)
+            if lcd is not None:
+                lcd.setSegmentStyle(QLCDNumber.SegmentStyle.Flat)
+                if hasattr(lcd, "setSmallDecimalPoint"):
+                    lcd.setSmallDecimalPoint(True)
+                self._field_gauss_lcd_match_attitude_size(lcd, gauss_digit_count=8)
+                cur.append((lcd, ax))
+                have.add(ax)
+        for ax, oname in self._WIT901_GAUSS_FALLBACK_LABEL_NAMES:
+            if ax in have:
+                continue
+            lab = self._find_label_widget(self._win, oname)
+            if lab is None:
+                continue
+            self._field_gauss_label_match_attitude(lab)
+            lab.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cur.append((lab, ax))
+            have.add(ax)
+
+    def _refresh_wit901_gauss_lcds(
+        self, w901_g: tuple[float, float, float] | None
+    ) -> None:
+        """Drive Wit901 Gauss widgets from one ``_snapshot_wit901_gauss()`` tuple (``mt102_swapped_xy`` applied)."""
+        if self._wit901_field_gauss_lcds is None:
+            self._wit901_field_gauss_lcds = self._discover_wit901_field_gauss_lcds()
+        self._wit901_merge_missing_axis_lcds()
+        if not self._wit901_field_gauss_lcds:
+            return
+        vals: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
+        if w901_g is not None and len(w901_g) == 3:
+            x, y, z = (float(w901_g[0]), float(w901_g[1]), float(w901_g[2]))
+            vals["X"] = x if math.isfinite(x) else None
+            vals["Y"] = y if math.isfinite(y) else None
+            vals["Z"] = z if math.isfinite(z) else None
+        for w, ax in self._wit901_field_gauss_lcds:
+            v = vals[ax]
+            if isinstance(w, QLCDNumber):
+                w.setDigitCount(8)
+                w.setMode(QLCDNumber.Mode.Dec)
+                if v is not None:
+                    w.display("%+.4f" % v)
+                    color = self._mag_lcd_color_gauss(
+                        v, self._mt102_gauss_green, self._mt102_gauss_amber
+                    )
+                else:
+                    w.display("---")
+                    color = _MEAS_LCD_NO_DATA
+                w.setStyleSheet(
+                    "background-color: %s; color: %s;" % (MT102_LCD_BG, color)
+                )
+            elif isinstance(w, QLabel):
+                if v is not None:
+                    w.setText("%+.4f" % v)
+                    color = self._mag_lcd_color_gauss(
+                        v, self._mt102_gauss_green, self._mt102_gauss_amber
+                    )
+                else:
+                    w.setText("---")
+                    color = _MEAS_LCD_NO_DATA
+                w.setStyleSheet(
+                    "background-color: %s; color: %s; padding: 2px 6px;"
+                    % (MT102_LCD_BG, color)
+                )
+
+    def _snapshot_wit901_gauss_raw(self) -> tuple[float, float, float] | None:
+        """Wit901 Gauss (X,Y,Z) from ``wit901_mag_stream`` with **no** ``mt102_swapped_xy`` remap."""
+        w = getattr(self, "_wit901", None)
+        if w is None:
+            return None
+        try:
+            g = w.get_latest_gauss()
+        except Exception:
+            return None
+        if g is None or len(g) != 3:
+            return None
+        return (float(g[0]), float(g[1]), float(g[2]))
+
+    def _wit901_gauss_after_mt102_swap(
+        self, g: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        """Apply ``[serial] mt102_swapped_xy`` X/Y interchange to a raw Wit901 Gauss triple."""
+        gx, gy, gz = g
+        ini = getattr(self, "_ini", None)
+        if ini is not None and _serial_mt102_swapped_xy(ini):
+            return (gy, gx, gz)
+        return (gx, gy, gz)
+
+    def _snapshot_wit901_gauss_raw_and_display(
+        self,
+    ) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None]:
+        """One UART snapshot: ``(raw, display)`` where display = raw after ``mt102_swapped_xy``."""
+        raw = self._snapshot_wit901_gauss_raw()
+        if raw is None:
+            return None, None
+        return raw, self._wit901_gauss_after_mt102_swap(raw)
+
+    def _snapshot_wit901_gauss(self) -> tuple[float, float, float] | None:
+        """Latest Wit901 Gauss for LCDs/sheets (same as display tuple from ``_snapshot_wit901_gauss_raw_and_display``)."""
+        raw = self._snapshot_wit901_gauss_raw()
+        if raw is None:
+            return None
+        return self._wit901_gauss_after_mt102_swap(raw)
 
     @staticmethod
     def _field_vector_to_rotation(
@@ -3036,19 +3765,32 @@ class CalibratorController:
     def _mag_lcd_color_raw(raw_val: int, green: int, amber: int) -> str:
         a = abs(int(raw_val))
         if a <= green:
-            return "green"
+            return _MEAS_LCD_GREEN
         if a <= amber:
             return MT102_AMBER
-        return "red"
+        return _MEAS_LCD_RED
 
     @staticmethod
     def _mag_lcd_color_gauss(gauss_val: float, green: float, amber: float) -> str:
         a = abs(float(gauss_val))
         if a <= green:
-            return "green"
+            return _MEAS_LCD_GREEN
         if a <= amber:
             return MT102_AMBER
-        return "red"
+        return _MEAS_LCD_RED
+
+    def _disconnect_wit901_only(self) -> None:
+        w = getattr(self, "_wit901", None)
+        if w is not None:
+            try:
+                w.disconnect()
+            except Exception:
+                pass
+        try:
+            self._refresh_wit901_gauss_lcds(None)
+        except Exception:
+            pass
+        self._wit901_field_gauss_lcds = None
 
     def _disconnect_mt102_only(self) -> None:
         if getattr(self, "_mt102", None) is not None:
@@ -3058,10 +3800,13 @@ class CalibratorController:
                 pass
             self._mt102 = None
             self._dbg_mt102_f_cal_logged = False
+            self._mt102_f_block_md_written = False
             self._mt102_cal_que_mono = 0.0
             self._mt102_fcal_polls_without_cal = 0
             self._mt102_fcal_missing_logged = False
             self._close_mag_test_xlsx()
+            self._close_external_drive_xlsx()
+            self._close_ambian_xlsx()
             self._refresh_mt102_fcal_applied_led()
         vd = getattr(self, "_viewer3d", None)
         if vd is not None and hasattr(vd, "set_rotation"):
@@ -3140,6 +3885,51 @@ class CalibratorController:
             if hasattr(self._mt102, "request_cal_data"):
                 self._mt102.request_cal_data()
             self._mt102_cal_que_mono = time.monotonic()
+        except Exception:
+            pass
+
+    def _connect_wit901_if_configured(self) -> None:
+        """Open Wit HWT901 on ``[serial] wit901_port`` after MT-102 (non-fatal if it fails)."""
+        if _w9_pkg is None:
+            self._dbg(3, "Wit901: skipped (wit901_mag_stream import failed)")
+            return
+        port = self._ini.get("serial", "wit901_port", fallback=_DEFAULT_WIT901_PORT).strip()
+        if not port:
+            self._dbg(3, "Wit901: skipped (wit901_port empty)")
+            return
+        # Skip Wit901 only when Pico serial is actually open on that COM (combo can match Pico port while idle).
+        if self._serial is not None:
+            pico = self._current_port().strip()
+            if pico and port.replace(" ", "").upper() == pico.replace(" ", "").upper():
+                self._dbg(3, "Wit901: skipped (same COM as Pico)")
+                return
+        try:
+            baud = int(
+                self._ini.get("serial", "wit901_baud", fallback=str(_DEFAULT_WIT901_BAUD)).strip()
+            )
+        except ValueError:
+            baud = _DEFAULT_WIT901_BAUD
+        w = getattr(self, "_wit901", None)
+        if w is None:
+            return
+        if not w.connect(port, baud):
+            QMessageBox.warning(
+                self._win,
+                "Wit901",
+                "Pico (and possibly MT-102) connected, but Wit901 failed to open.\n"
+                "Check [serial] wit901_port / wit901_baud in %s." % (_INI_PATH.name,),
+            )
+            return
+        self._dbg(3, "Wit901: opened", port, "@", baud)
+        self._set_status("%s | Wit901 %s @ %d" % (self._status_main.text(), port, baud))
+        try:
+            sys.stderr.write(
+                "[CalibratorUI] Wit901 field is Gauss: wit901_mag_stream int16 → "
+                "(16/32768) µT/LSB, G = µT/100 (same unit as MT102 Gauss columns). "
+                "[serial] mt102_swapped_xy=true|T|1 when MT-102 stream still has legacy swapped mag X/Y (Wit901 Gauss "
+                "X/Y is then swapped for alignment); F/false/0 for reworked units (default F from load_ini).\n"
+            )
+            sys.stderr.flush()
         except Exception:
             pass
 
@@ -3233,6 +4023,12 @@ class CalibratorController:
                     "Gauss_Y",
                     "RAW_Z",
                     "Gauss_Z",
+                    "W901_Gauss_X",
+                    "W901_Gauss_Y",
+                    "W901_Gauss_Z",
+                    "W901_Raw_Gauss_X",
+                    "W901_Raw_Gauss_Y",
+                    "W901_Raw_Gauss_Z",
                 ]
             )
             self._mag_test_wb = wb
@@ -3260,8 +4056,10 @@ class CalibratorController:
         gx: float,
         gy: float,
         gz: float,
+        w901_g: tuple[float, float, float] | None = None,
+        w901_g_raw: tuple[float, float, float] | None = None,
     ) -> None:
-        """One DEBUG=5 row: host time, TM coil V, MT102 raw + Gauss (factory F-cal only)."""
+        """One DEBUG=5 row: host time, TM coil V, MT102 raw + Gauss; Wit901 Gauss (swapped) + raw same poll."""
         if not self._ensure_mag_test_xlsx():
             return
         ws = self._mag_test_ws
@@ -3279,6 +4077,17 @@ class CalibratorController:
                 return None
             return float(v)
 
+        def _fin_g3(
+            g: tuple[float, float, float] | None,
+        ) -> tuple[float | None, float | None, float | None]:
+            if g is None:
+                return (None, None, None)
+            a, b, c = g
+            return (_fin_g(float(a)), _fin_g(float(b)), _fin_g(float(c)))
+
+        wx, wy, wz = _fin_g3(w901_g)
+        wrx, wry, wrz = _fin_g3(w901_g_raw)
+
         try:
             ws.append(
                 [
@@ -3292,6 +4101,12 @@ class CalibratorController:
                     _fin_g(gy),
                     int(getattr(mag, "z")),
                     _fin_g(gz),
+                    wx,
+                    wy,
+                    wz,
+                    wrx,
+                    wry,
+                    wrz,
                 ]
             )
             self._mag_test_xlsx_row_count += 1
@@ -3306,8 +4121,158 @@ class CalibratorController:
                 pass
             self._close_mag_test_xlsx()
 
+    def _close_external_drive_xlsx(self) -> None:
+        wb = self._external_drive_wb
+        if wb is None:
+            return
+        try:
+            wb.save(str(_EXTERNAL_DRIVE_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] ExternalDrive.xlsx save failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+        self._external_drive_wb = None
+        self._external_drive_ws = None
+        self._external_drive_row_count = 0
+
+    def _ensure_external_drive_xlsx(self) -> bool:
+        if _OpenpyxlWorkbook is None:
+            return False
+        if self._external_drive_wb is not None:
+            return True
+        try:
+            wb = _OpenpyxlWorkbook()
+            ws = wb.active
+            ws.title = "ExternalDrive"
+            ws.append(
+                [
+                    "timestamp",
+                    "coil_V_X",
+                    "coil_V_Y",
+                    "coil_V_Z",
+                    "RAW_X",
+                    "Gauss_X",
+                    "RAW_Y",
+                    "Gauss_Y",
+                    "RAW_Z",
+                    "Gauss_Z",
+                    "W901_Gauss_X",
+                    "W901_Gauss_Y",
+                    "W901_Gauss_Z",
+                    "W901_Raw_Gauss_X",
+                    "W901_Raw_Gauss_Y",
+                    "W901_Raw_Gauss_Z",
+                    "bench_V_X",
+                    "bench_V_Y",
+                    "bench_V_Z",
+                    "bench_I_X",
+                    "bench_I_Y",
+                    "bench_I_Z",
+                ]
+            )
+            self._external_drive_wb = wb
+            self._external_drive_ws = ws
+            self._external_drive_row_count = 0
+            wb.save(str(_EXTERNAL_DRIVE_XLSX_PATH))
+        except Exception as e:
+            self._external_drive_wb = None
+            self._external_drive_ws = None
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] ExternalDrive.xlsx init failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _append_external_drive_xlsx_row(
+        self,
+        vx: float | None,
+        vy: float | None,
+        vz: float | None,
+        mag: object,
+        gx: float,
+        gy: float,
+        gz: float,
+        w901_g: tuple[float, float, float] | None = None,
+        w901_g_raw: tuple[float, float, float] | None = None,
+    ) -> None:
+        """Append one row while External Drive mode is active (Pico off; coil V usually blank)."""
+        if not self._external_drive_active:
+            return
+        if not self._ensure_external_drive_xlsx():
+            return
+        ws = self._external_drive_ws
+        wb = self._external_drive_wb
+        if ws is None or wb is None:
+            return
+
+        def _fin(v: float | None) -> float | None:
+            if v is None or not math.isfinite(v):
+                return None
+            return float(v)
+
+        def _fin_g(v: float) -> float | None:
+            if not math.isfinite(v):
+                return None
+            return float(v)
+
+        def _fin_g3(
+            g: tuple[float, float, float] | None,
+        ) -> tuple[float | None, float | None, float | None]:
+            if g is None:
+                return (None, None, None)
+            a, b, c = g
+            return (_fin_g(float(a)), _fin_g(float(b)), _fin_g(float(c)))
+
+        wx, wy, wz = _fin_g3(w901_g)
+        wrx, wry, wrz = _fin_g3(w901_g_raw)
+        try:
+            ws.append(
+                [
+                    datetime.datetime.now(),
+                    _fin(vx),
+                    _fin(vy),
+                    _fin(vz),
+                    int(getattr(mag, "x")),
+                    _fin_g(gx),
+                    int(getattr(mag, "y")),
+                    _fin_g(gy),
+                    int(getattr(mag, "z")),
+                    _fin_g(gz),
+                    wx,
+                    wy,
+                    wz,
+                    wrx,
+                    wry,
+                    wrz,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+            )
+            self._external_drive_row_count += 1
+            if self._external_drive_row_count % _EXTERNAL_DRIVE_SAVE_EVERY_N == 0:
+                wb.save(str(_EXTERNAL_DRIVE_XLSX_PATH))
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[CalibratorUI] ExternalDrive.xlsx append failed: %s\n" % (e,)
+                )
+            except Exception:
+                pass
+            self._close_external_drive_xlsx()
+
     def _mag_poll(self) -> None:
         """Poll MT-102 for M packets; update data monitor, optional LCDs, 3D viewer."""
+        self._refresh_wit901_gauss_lcds(self._snapshot_wit901_gauss())
         if not getattr(self, "_mt102", None) or self._mt102 is None:
             return
         try:
@@ -3334,6 +4299,27 @@ class CalibratorController:
                         "ini [mt102_display] mag_raw_to_gauss. serial=%s"
                         % (getattr(c0, "serial_number", "?"),),
                     )
+                    if not self._mt102_f_block_md_written:
+                        fn = getattr(self._mt102, "build_f_block_capture_markdown", None)
+                        if callable(fn):
+                            md = fn()
+                            if md:
+                                try:
+                                    _F_BLOCK_CAPTURE_PATH.write_text(
+                                        md, encoding="utf-8", newline="\n"
+                                    )
+                                    self._mt102_f_block_md_written = True
+                                    self._dbg(
+                                        3,
+                                        "MT102: F-block capture →",
+                                        str(_F_BLOCK_CAPTURE_PATH.resolve()),
+                                    )
+                                except OSError as e:
+                                    self._dbg(
+                                        3,
+                                        "MT102: F_BLOCK_CAPTURE.md write failed:",
+                                        str(e),
+                                    )
             except Exception:
                 pass
         if mag is None:
@@ -3384,9 +4370,21 @@ class CalibratorController:
                 have_g = all(math.isfinite(v) for v in (gx, gy, gz))
             except Exception:
                 return
-        if self._debug_level == _MT102_TRACE_DEBUG_MIN:
+        if (
+            self._debug_level == _MT102_TRACE_DEBUG_MIN
+            and not self._external_drive_active
+        ):
             vx, vy, vz = self._coil_v_xyz_from_last_tm()
-            self._append_mag_test_xlsx_row(vx, vy, vz, mag, gx, gy, gz)
+            w901_raw, w901_g = self._snapshot_wit901_gauss_raw_and_display()
+            self._append_mag_test_xlsx_row(
+                vx, vy, vz, mag, gx, gy, gz, w901_g=w901_g, w901_g_raw=w901_raw
+            )
+        if self._external_drive_active:
+            evx, evy, evz = self._coil_v_xyz_from_last_tm()
+            ew901_raw, ew901_g = self._snapshot_wit901_gauss_raw_and_display()
+            self._append_external_drive_xlsx_row(
+                evx, evy, evz, mag, gx, gy, gz, w901_g=ew901_g, w901_g_raw=ew901_raw
+            )
         for name, val in (
             ("lcdNumber_MT102_X_raw", mag.x),
             ("lcdNumber_MT102_Y_raw", mag.y),
@@ -3423,7 +4421,7 @@ class CalibratorController:
         vals = {"X": gx, "Y": gy, "Z": gz}
         for lcd, ax in self._mt102_field_gauss_lcds:
             val = vals[ax]
-            lcd.setDigitCount(9)
+            lcd.setDigitCount(7)
             lcd.setMode(QLCDNumber.Mode.Dec)
             if have_g:
                 lcd.display("%.3f" % val)
@@ -3583,13 +4581,105 @@ class CalibratorController:
             self._combo_baud.setEnabled(True)
         self._update_status_leds()
 
+    def _set_pico_path_widgets_enabled(self, enabled: bool) -> None:
+        """External Drive bench mode: disable Pico COM, coils, Test NULL, SAFE/Reset."""
+        if self._combo_port is not None:
+            self._combo_port.setEnabled(enabled)
+        if self._combo_baud is not None:
+            self._combo_baud.setEnabled(enabled)
+        if self._btn_connect is not None:
+            self._btn_connect.setEnabled(enabled)
+        if self._btn_safe is not None:
+            self._btn_safe.setEnabled(enabled)
+        if getattr(self, "_btn_reset", None) is not None:
+            self._btn_reset.setEnabled(enabled)
+        if self._master_coils_enable is not None:
+            self._master_coils_enable.setEnabled(enabled)
+        if self._testcal_chk is not None:
+            self._testcal_chk.setEnabled(enabled)
+        if self._btn_set_coil_v is not None:
+            self._btn_set_coil_v.setEnabled(enabled)
+        for _ax, sp, pb, _lcd, chk in self._axis_rows:
+            if sp is not None:
+                sp.setEnabled(enabled)
+            if pb is not None:
+                pb.setEnabled(enabled)
+            if chk is not None:
+                chk.setEnabled(enabled)
+        if self._volt_override_chk is not None:
+            self._volt_override_chk.setEnabled(enabled)
+        for _ax, sp in self._volt_override_spins.items():
+            sp.setEnabled(enabled)
+
+    def _connect_external_drive_sensors(self) -> None:
+        """Open MT-102 then Wit901; no Pico. Caller starts `_serial_timer` for `_mag_poll`."""
+        self._disconnect_wit901_only()
+        self._disconnect_mt102_only()
+        self._connect_mt102_after_pico()
+        if getattr(self, "_mt102", None) is None:
+            self._set_status("External Drive: MT-102 did not open — check ini [serial] ports.")
+            return
+        self._connect_wit901_if_configured()
+
+    def _stop_external_drive_mode(self) -> None:
+        """Disconnect sensors, stop mag poll timer, re-enable Pico widgets."""
+        self._external_drive_active = False
+        self._close_external_drive_xlsx()
+        self._disconnect_wit901_only()
+        self._disconnect_mt102_only()
+        try:
+            self._serial_timer.stop()
+        except Exception:
+            pass
+        self._set_pico_path_widgets_enabled(True)
+        self._status_conn.setText("Connection: Disconnected")
+        self._set_status("External Drive off — use Connect All for Pico.")
+
+    def _on_external_drive_toggled(self, checked: bool) -> None:
+        if self._chk_external_drive is None:
+            return
+        if checked:
+            if self._serial is not None:
+                self._disconnect()
+            self._set_pico_path_widgets_enabled(False)
+            self._external_drive_active = True
+            self._connect_external_drive_sensors()
+            if getattr(self, "_mt102", None) is None:
+                self._external_drive_active = False
+                self._set_pico_path_widgets_enabled(True)
+                self._chk_external_drive.blockSignals(True)
+                self._chk_external_drive.setChecked(False)
+                self._chk_external_drive.blockSignals(False)
+                QMessageBox.warning(
+                    self._win,
+                    "External Drive",
+                    "MT-102 did not connect. Check [serial] rs422_port / rs232_port / baud_rate in CalibratorUI.ini.",
+                )
+                return
+            try:
+                self._serial_timer.start()
+            except Exception:
+                pass
+            self._status_conn.setText(
+                "Connection: External drive (MT-102 + Wit901, no Pico)"
+            )
+            self._set_status(
+                "External Drive: sensors live; logging to ExternalDrive.xlsx (openpyxl)."
+            )
+        else:
+            self._stop_external_drive_mode()
+
     def _on_connect_clicked(self) -> None:
+        if self._external_drive_active:
+            return
         if self._serial is not None:
             self._disconnect()
             return
         self._connect()
 
     def _connect(self) -> None:
+        if self._external_drive_active:
+            return
         port = self._current_port()
         if not port:
             self._set_status("Select a COM port.")
@@ -3677,12 +4767,19 @@ class CalibratorController:
         # Baseline for "no traffic yet" STALE: opening the port can predate CDC + firmware streaming by seconds.
         self._connect_mono_ts = time.monotonic()
         self._serial_timer.start()
+        if self._text_out is not None:
+            self._append_pico_log_line(
+                "[CalibratorUI] This log shows Pico TXT:: only; TM:: updates the coil/current LCDs. "
+                "Check master coil enable + Test V for PWM. If LCDs stay ---, try soft_reset_on_connect=1 "
+                "in CalibratorUI.ini [serial] or power-cycle the Pico / verify COM."
+            )
         QTimer.singleShot(0, self._connect_rx_pump_slice)
         QTimer.singleShot(100, self._send_axis_enables_to_pico)
         # Boot TXT:: is emitted once at Pico start; if we did not soft-reset, that stream was missed.
         if not self._soft_reset_on_connect_pref():
             QTimer.singleShot(280, self._request_hw_report_after_connect)
         self._connect_mt102_after_pico()
+        self._connect_wit901_if_configured()
 
     def _send_axis_enables_to_pico(self) -> None:
         """After connect: push set_*_v from Test V spinboxes (when present), then enable_X/Y/Z.
@@ -3826,7 +4923,8 @@ class CalibratorController:
 
     def _disconnect(self) -> None:
         self._dbg(1, "disconnect: stopping timers and closing serial")
-        self._null_servo_stop(send_safe=False)
+        self._testcal_stop(send_safe=False)
+        self._disconnect_wit901_only()
         self._disconnect_mt102_only()
         self._connect_rx_pump_slices = 0
         self._connect_mono_ts = None
@@ -3838,6 +4936,7 @@ class CalibratorController:
         self._tm_dbg_setx_absent_x_present_pending = False
         self._last_tm_kv = None
         self._close_mag_test_xlsx()
+        self._close_external_drive_xlsx()
         self._serial_timer.stop()
         self._rx_buf.clear()
         if self._serial is not None:

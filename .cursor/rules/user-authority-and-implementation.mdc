@@ -1,0 +1,23 @@
+---
+description: User is authoritative; remove means full delete; direct sound code only (no second-guessing, no faux layers).
+alwaysApply: true
+---
+
+# User authority & implementation standards (CoilDriver)
+
+## Authority
+
+- The user is the **definitive** source for how this project must operate (requirements, protocol, safety, and intent).
+- **Do not** second-guess the user’s decisions or substitute your own product judgment for theirs.
+- Follow their **explicit** directions for behavior and scope. If something is genuinely ambiguous or unsafe in a way only they can decide, ask **one** short question—otherwise execute.
+
+## “Remove” means gone
+
+- **Remove**, **delete**, **strip**, or **drop** means **eliminate completely** from the tree: no commented-out blocks, no “temporary” retention, no indirect preservation via compatibility shims, no leaving old identifiers only to return `ERR …` unless the user explicitly asked for that migration behavior.
+- Do **not** “reuse later,” “set aside,” or partially delete when they asked for full removal.
+
+## Code quality (real implementation only)
+
+- **No** mocks, fakes, stubs, prototypes, placeholders, scaffolding, or faux/indirect ways to pretend a feature exists (see also **No mock code** in `edit-scope-and-approval.mdc`).
+- Write **straightforward, tight, clean** code: clear control flow, minimal unnecessary abstraction, sound engineering and normal Python practice—no clever layers “for future flexibility” unless the user asked for that architecture.
+- Prefer **real** behavior (hardware, serial, real files) or **omit** until it can be implemented for real; if it cannot be done without a stand-in, **stop and ask** the user.
