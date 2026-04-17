@@ -1,11 +1,11 @@
 # main.py — MicroPython entry point (auto-start on every boot / reset)
 #
 # On power-up or reset, MicroPython runs boot.py (if present), then this file.
-# This file always imports coil_driver_app and calls main() so the coil driver
+# This file always imports drok_coil_driver_app and calls main() so the coil driver
 # runs automatically — no manual start required.
 #
 # REPL vs deploy while the app is running:
-# - The USB serial port is shared. While coil_driver_app.main() is running, the
+# - The USB serial port is shared. While drok_coil_driver_app.main() is running, the
 #   interactive prompt (>>>) is not shown until you interrupt the script.
 # - Interactive REPL: open the serial terminal and press Ctrl+C once. That raises
 #   KeyboardInterrupt, stops main(), and you get the >>> prompt to try code.
@@ -15,9 +15,9 @@
 #   ./DEPLOY to the device. You do not need the >>> prompt open to deploy.
 
 try:
-    import coil_driver_app
+    import drok_coil_driver_app
 
-    coil_driver_app.main()
+    drok_coil_driver_app.main()
 except Exception as e:
     import sys
 

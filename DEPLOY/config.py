@@ -143,7 +143,38 @@ BACK_BUTTON_GP = 17
 BACK_BUTTON_LONG_PRESS_MS = 3000
 BACK_BUTTON_DEBOUNCE_MS = 80
 
-# NO switch to GND = latched SAFE (same as host `safe`): internal pull-up, IRQ → PWM off until safe_reset.
-# 0 = disabled. Default GP16 avoids DRV8871 (10–15) and I2C (2–3, 4–5).
+# Operate / SAFE (DROK per-enclosure): SPST one side GP16, other GND; internal pull-up.
+# Open (HIGH) = SAFE — DROK off + relays default; closed to GND (LOW) = Operate. See DROK_MODS.md.
+# 0 = disabled (not recommended for production DROK build).
 HARDWARE_ESTOP_GP = 16
 HARDWARE_ESTOP_DEBOUNCE_MS = 80
+
+# --- DROK XY6020L — single axis per Pico (`drok_coil_driver_app.py`; DROK_MODS.md) ---
+DROK_UART_ID = 0
+DROK_UART_TX_PIN = 0
+DROK_UART_RX_PIN = 1
+DROK_UART_BAUD = 115200
+DROK_MODBUS_SLAVE = 1
+DROK_RELAY_IN1_PIN = 10
+DROK_RELAY_IN2_PIN = 11
+# Max constant-current limit written to DROK I-SET (A); XY6020L supports up to 20 A — set conservatively.
+DROK_I_SET_LIMIT_A = 8.0
+# Per-unit identity + LCD address on Pico flash (see drok_coil_driver_app.py). Same firmware on X/Y/Z enclosures.
+DROK_AXIS_CONFIG_FILENAME = "axis_config.ini"
+# If axis_config.ini is missing or has no controlled_axis= line, use this LCD line-1 label (16 chars max).
+DROK_CONTROLLED_AXIS_DEFAULT = "X COIL"
+# Minimum gap between Modbus frames (XY6020L can miss answers if polled too fast; 50+ ms typical).
+DROK_MODBUS_INTER_FRAME_MS = 55
+# UART read window for Modbus response.
+DROK_MODBUS_RX_TIMEOUT_MS = 220
+# OVP/OCP are stored in the XY6020L preset memory block (Modbus start 0x50 + slot*0x10). 0 = CD0.
+DROK_PRESET_SLOT = 0
+# Pause after output-off before writing preset (ms).
+DROK_PRESET_WRITE_SETTLE_MS = 40
+# Before changing relay GPIO: ensure DROK output is off; then wait (ms).
+DROK_RELAY_PRE_TOGGLE_MS = 50
+# set_pol POS | NEG: relay energized (1) / de-energized (0) for IN1/IN2 — must match harness (DROK_MODS.md).
+DROK_SET_POL_POS_R1 = 0
+DROK_SET_POL_POS_R2 = 0
+DROK_SET_POL_NEG_R1 = 1
+DROK_SET_POL_NEG_R2 = 0

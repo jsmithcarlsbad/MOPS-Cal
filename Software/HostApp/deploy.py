@@ -38,16 +38,16 @@ from pathlib import Path
 
 # deploy.py tool version (this host script only; bump MINOR for behavior or messaging changes).
 DEPLOY_SCRIPT_VERSION_MAJOR = 1
-DEPLOY_SCRIPT_VERSION_MINOR = 3
+DEPLOY_SCRIPT_VERSION_MINOR = 4
 DEPLOY_SCRIPT_VERSION = "%d.%d" % (DEPLOY_SCRIPT_VERSION_MAJOR, DEPLOY_SCRIPT_VERSION_MINOR)
 
 # MicroPython default over USB CDC; host baud is often ignored but pyserial needs a value.
 _DEFAULT_BAUD = 115200
 
-# Complete import closure for coil_driver (main -> coil_driver_app -> config, ina3221, I2C_LCD -> LCD_API).
+# Complete import closure for coil_driver (main -> drok_coil_driver_app -> config, ina3221, I2C_LCD -> LCD_API).
 PICO_FIRMWARE_REQUIRED: tuple[str, ...] = (
     "main.py",
-    "coil_driver_app.py",
+    "drok_coil_driver_app.py",
     "config.py",
     "ina3221.py",
     "I2C_LCD.py",
@@ -80,7 +80,7 @@ def _missing_required_firmware(deploy: Path) -> list[str]:
 
 
 def _read_coil_driver_version(coil_driver_py: Path) -> str | None:
-    """Parse VERSION_MAJOR / VERSION_MINOR from coil_driver_app.py."""
+    """Parse VERSION_MAJOR / VERSION_MINOR from drok_coil_driver_app.py."""
     try:
         text = coil_driver_py.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -93,14 +93,14 @@ def _read_coil_driver_version(coil_driver_py: Path) -> str | None:
 
 
 def _print_deploy_version_banner(deploy: Path, *, after_upload: bool) -> None:
-    ver = _read_coil_driver_version(deploy / "coil_driver_app.py")
+    ver = _read_coil_driver_version(deploy / "drok_coil_driver_app.py")
     line = "=" * 70
     print(line)
     print(f"  deploy.py {DEPLOY_SCRIPT_VERSION}")
     if ver:
         print(f"  Coil driver firmware in DEPLOY: {ver}")
     else:
-        print("  Coil driver firmware in DEPLOY: (could not read VERSION from coil_driver_app.py)")
+        print("  Coil driver firmware in DEPLOY: (could not read VERSION from drok_coil_driver_app.py)")
     print("  Source of truth: Software/Pico/  ->  copied to  DEPLOY/  on each deploy")
     if after_upload:
         print()
@@ -262,9 +262,9 @@ def main() -> int:
     r = cmd_sync_pico_to_deploy()
     if r != 0:
         return r
-    ver = _read_coil_driver_version(_deploy_dir() / "coil_driver_app.py")
+    ver = _read_coil_driver_version(_deploy_dir() / "drok_coil_driver_app.py")
     if ver:
-        print(f"(Software/Pico -> DEPLOY done; coil_driver_app version {ver})")
+        print(f"(Software/Pico -> DEPLOY done; drok_coil_driver_app version {ver})")
 
     return cmd_deploy(
         args.port.strip(),
