@@ -68,10 +68,10 @@ DROK‑native (no X/Y/Z suffix; one DROK per Pico):
 
 **LCD (host → operator at the enclosure):**
 
-- **`ESTOP`** — Same **safe** action as **`safe`** / physical SAFE: DROK output off, relays de‑energized, host drive latched off. Optional custom **two lines** (16 ASCII characters each, left‑aligned / space‑padded):  
+- **`ESTOP`** — Same **safe** action as **`safe`** / physical SAFE: DROK output off, relays de‑energized, host drive latched off. Optional custom **two lines** (up to 16 printable ASCII characters each, **centered** on the 16×2 panel after sanitizing):  
   `ESTOP line1|line2`  
   If omitted, defaults to `HOST ESTOP` and `OUTPUT OFF`. Pipe **`|`** separates line 1 and line 2 (no pipe → second line uses default).
-- **`INFO`** `line1|line2` — Does **not** change power state; shows operator instructions (step number, “move MT‑102”, etc.). **Requires** non‑empty payload; use `|` for two lines (second line may be blank after `|`).
+- **`INFO`** `line1|line2` — Does **not** change power state; shows operator instructions (step number, “move MT‑102”, etc.). **Requires** non‑empty payload; use `|` for two lines (second line may be blank after `|`). Each line is **centered** on the 16‑character row (same sanitizing as **`ESTOP`**).
 - **`lcd_clear`** (aliases: **`info_clear`**, **`clear_lcd`**) — Clears host LCD override (`INFO` / `ESTOP` custom text); normal axis / version or deploy / SAFE screens resume.
 - **`host_operate`** (aliases: **`clear_estop`**, **`estop_clear`**) — Clears **host** latched SAFE / ESTOP so the Pico may accept drive again **only if** the physical **Operate / SAFE** switch is **Operate** (contact closed). If the switch is still **SAFE** (open), returns **`ERR physical_SAFE_open`**.
 - **`relay_1` / `relay_2`** (aliases **`rly1` / `rly2`**) **`ON` \| `OFF`** — Drives polarity relay optos (**active‑low** modules: **ON** = GPIO **LOW** = energized). **Refused in SAFE** (`ERR safe`). Before a state change, firmware turns **DROK output off** and waits **`DROK_RELAY_PRE_TOGGLE_MS`** (see `config.py`).
@@ -97,9 +97,11 @@ Exact `OK …` / `TM:: …` strings are defined by the firmware version in the r
 
 ---
 
-*Document version follows firmware `VERSION_MAJOR.MINOR` in `drok_coil_driver_app.py` (currently 1.4+).*
+*Document version follows firmware `VERSION_MAJOR.MINOR` in `drok_coil_driver_app.py` (currently **6.2**).*
 
 **`TM::` extensions:** `relay_1` / `relay_2` are **`0`** = de‑energized (GPIO high), **`1`** = energized (GPIO low), matching the relay command `ON`/`OFF` sense. **`coil_pol=`** repeats **`POS`** / **`NEG`** / **`MIXED`** / **`MISSING`** from **`get_pol`**.
+
+**CC status (CalibratorUI `radioButton_[XYZ]_LED_Coil_CC`):** `drok_cc_mode=0|1`, `drok_cc_ma=…`, and **`drok_cc_led=0|1|2`** — **`0`** = red (CC mode off, output off, or no target current); **`1`** = lime (CC mode on and supply appears to be current‑regulating vs `set_*_v` ceiling); **`2`** = yellow (CC mode on but not maintaining CC — e.g. voltage‑limited or current mismatch). Interpret with **`drok_axis=`** (`X`/`Y`/`Z`) so the host lights the matching axis LED.
 
 **Polarity vs harness:** If **`POS`** / **`NEG`** do not match coil markings on the bench, either swap host usage (**`POS`** ↔ **`NEG`**) or change **`DROK_SET_POL_*_*`** in `Software/Pico/config.py` (and redeploy) so the patterns match your wiring.
 

@@ -2,12 +2,13 @@
 """
 CalibratorUI — PySide6 host for the CoilDriver Pico (serial).
 
-Loads CalibratorUI_MOPS.ui from this directory. Settings in CalibratorUI.ini (UTF-8).
+Loads **CalibratorUI_DROK.ui** only. Settings in CalibratorUI.ini (UTF-8).
 
-  [serial]: Pico `pico_port` + `baud` (legacy `port` is written with the same value on save); MT-102
+  [serial]: Pico `pico_port` + `baud` (alias `port` is written with the same value on save); MT-102
   `rs422_port`, `rs232_port`, `baud_rate`.
-  **Site Calibration** only (not under Settings): top-level ``menuSite_Calibration`` from Designer gets
-  ``MT-102 Gauss scale...`` and ``Align MT-102 scale to reference meter...`` (programmatic ``QAction``s).
+  **Calibration** menu (Designer: ``menuSite_Calibration`` or ``menuCalibration``): runtime title **Calibration**; host adds
+  ``Generate cross-coupling matrix…`` (programmatic ``QAction``). Per-axis display scaling uses
+  ``doubleSpinBox_[XYZ]_Gauss_CalFactor`` (Gauss CalFactor), not menu dialogs.
   ``objectName`` may be on the menubar ``QAction`` or the ``QMenu`` — both are resolved.
   Connect all (`pushButton_ConnectAll`): opens Pico serial first, then MT-102 from ini (dual COM + threaded reader),
   then Wit HWT901 on ``[serial] wit901_port`` (default COM10) via ``wit901_mag_stream`` protocol in a **daemon thread**;
@@ -17,10 +18,10 @@ Loads CalibratorUI_MOPS.ui from this directory. Settings in CalibratorUI.ini (UT
   (mag X/Y still swapped on the stream); the host then swaps Wit901 **Gauss** X/Y **after** conversion so ``W901_Gauss_*``
   and Wit LCDs match that stream for plots. Use ``false``/``F``/``0`` for **reworked** MT-102 (correct axes, matches Wit901).
   When the key is missing, ``load_ini`` seeds ``mt102_swapped_xy = F``. The GUI snapshots 901 Gauss on the **same timer pass** as
-  MT102 for ``MagTest.xlsx`` / ``AmbianReadings.xlsx`` rows.
+  MT102 for ``MagTest.xlsx`` rows (DEBUG=5, openpyxl).
   Disconnect closes Wit901, then MT-102, then Pico (host_disconnect). 3D view embeds after `show()` (PyVista/Qt).
   **External Drive** (optional ``checkBox_ExternalDrive``): bench mode — no Pico. Checking the box disconnects the Pico
-  if connected, opens MT-102 + Wit901 only, starts the same poll timer for real-time LCDs, disables Pico/coil/Test NULL
+  if connected, opens MT-102 + Wit901 only, starts the same poll timer for real-time LCDs, disables Pico/coil
   controls, and appends MT-102 + Wit901 samples to ``ExternalDrive.xlsx`` (coil V columns blank; ``bench_V_*`` /
   ``bench_I_*`` columns for you to fill from the external supply). Unchecking disconnects sensors and restores normal UI.
   Optional ``radioButton_F_CalApplied`` (Designer): LED-style — **gray** only when MT-102 is not connected;
@@ -36,15 +37,18 @@ Loads CalibratorUI_MOPS.ui from this directory. Settings in CalibratorUI.ini (UT
   Updated each ``_mag_poll`` tick.
   **Gauss (apples-to-apples):** Wit901 X/Y/Z use ``wit901_mag_stream.lsbs_to_gauss`` (Wit int16 → ±16 µT full scale,
   then **G = µT / 100**). MT102 X/Y/Z Gauss use factory F-cal corrected counts × ``[mt102_display] mag_raw_to_gauss``.
-  Both paths are **Gauss** for LCDs, ``MagTest.xlsx``, and ``AmbianReadings.xlsx``; magnitude agreement still depends
+  Both paths are **Gauss** for LCDs and ``MagTest.xlsx``; magnitude agreement still depends
   on sensor position and soft iron. ``mt102_swapped_xy`` drives Wit901 Gauss X/Y remap vs legacy MT-102 (see above).
 
 Serial line protocol (newline-terminated):
   TXT:: <text> — shown in textEdit_CalibratorTestOutput (boot, I2C scan, command replies).
-  TM:: key=value ... — telemetry: LEDs (alarm, cfg, closed_loop, meas_ok); measured mA and coil V
+  TM:: key=value ... — telemetry (alarm, cfg, closed_loop, meas_ok, DROK measured_ma / measured_vdc, etc.).
     (Host: TM lines that lost the leading prefix may be repaired if they start with '=float set_Y_v=' — restores set_X_v.)
-    LCDs (lcdNumber_[XYZ]_mA from X_ma/Y_ma/Z_ma, with diag_Ch*_ma + ina_*_ch fallback if *_ma is nan;
-    lcdNumber_[XYZ]_Volts from coil_V_X/Y/Z; digit color vs set_*_v when |set| < ~12 V (otherwise 12 V bus bands).
+    **Coil current (mA):** the **DROK** PSU measures coil current; the **Pico** reads it (e.g. Modbus) and forwards it in TM
+    as ``X_ma`` / ``Y_ma`` / ``Z_ma``, ``measured_ma`` (and related diag keys). This host shows those values on
+    **lcdNumber_[XYZ]_Coil_Current**. Bus voltage uses **lcdNumber_[XYZ]_Coil_Volts** from TM ``coil_V_*``, ``measured_vdc``, etc.
+    Helmholtz modeled Gauss (axis Gauss LCDs, null-indicator model, TM CSV Gauss columns) uses **only** that TM coil mA as the
+    applied current — the host does **not** infer current from V/R. Optional per-axis TM current scale factors in ini may be added later.
     Unprefixed TM-shaped rows use the same parser and are not copied
     to the text log.
   On connect: by default the host does not reset the Pico — it clears DTR/RTS after opening the COM port (Windows often toggles them and resets RP2040), then waits briefly for boot / CDC.
@@ -52,41 +56,33 @@ Serial line protocol (newline-terminated):
     Firmware prints TXT:: OK VERSION … and a hardware report at boot, then streams TM:: every control loop (~LOOP_Hz) with X/Y/Z always present; no host keepalive.
     Optional Settings → "Soft reset on connect" (CalibratorUI.ini [serial] soft_reset_on_connect=1): Ctrl+C then Ctrl+D (MicroPython soft reset),
     then a short boot wait — use only when stuck in >>> REPL.
-  Link “fresh” on any TXT:: or TM:: line. Stale: no traffic for ~8 s before the first line after connect, or >3 s after traffic stops (yellow LED + status; STALE dbg at DEBUG==1 once per episode).
-  On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready; legacy abort still on Pico).
-  Status bar Reset sends `safe_reset`: Pico turns off all bridge PWM (IN1 duty 0, inactive) like `safe`. SAFE sends `safe` (same coil-off path; not latched). Soft reset on connect (Ctrl+C Ctrl+D) restarts firmware; boot forces PWM outputs off until host commands again.
-  Settings (menu, saved in CalibratorUI.ini [settings]): PWM 3/5 kHz (host display / legacy; Pico 5.x fixes Hz in firmware).
-    Each axis Set sends: set_<axis>_v from doubleSpinBox_Test_<axis>_V (volts); coils must be enabled (see below).
-  Optional lcdNumber_X_Gauss / Y / Z: estimated |B| (Gauss) at Helmholtz midpoint from [helmholtz]
-  x_diameter_mm, x_turns (pair formula). Drive current for that model: prefer I = |V|/R from TM coil_V_* (or
-  set_*_v) and ini [helmholtz] x_r_ohm / y_r_ohm / z_r_ohm when R>0; else TM measured mA. Updated every TM::.
+  Link “fresh” on any TXT:: or TM:: line. Stale: no traffic for ~8 s before the first line after connect, or >3 s after traffic stops (status line + STALE dbg at DEBUG==1 once per episode).
+  On Disconnect / app quit: host sends host_disconnect (coils off, deploy-ready).
+  Status bar Reset sends `safe_reset` when supported by the connected firmware. SAFE (`safe`) is a temporary
+  shutdown of drive output for the connected axis/unit (per firmware); the serial link may stay open. To restore the
+  same post-connect enable_x/y/z handshake the operator disconnects and reconnects serial (or follows firmware
+  paths such as host_operate when physical Operate allows). Soft reset on connect (Ctrl+C Ctrl+D) restarts firmware when enabled in ini.
+  Settings (menu, saved in CalibratorUI.ini [settings]): PWM 3/5 kHz (host display; firmware may fix Hz independently).
   Optional frame_NullIndicator + label_NullIndicatorText: host-defined “null-like” banner when
   |mA| is above a floor on all axes and the three Gauss estimates are within 1% spread (not B⃗=0).
-  Optional pushButton_Set_Coil_Voltages (with voltage override widgets): applies all three Test V spinboxes via set_*_v.
-  Coil command voltage to the Pico is only the Test V doubleSpinBox values, coil enable(s),
-  Set coil voltages / per-axis Set, and the connect-time sync — nothing else sends set_*_v.
-  Coil enable: **checkBox_TestVoltageSetting** is the master checkbox (drives enable_x/y/z together) and,
-  when the full Test V widget set is present, gates voltage override toward the Test V spinboxes; its state
-  is **not** saved or restored from CalibratorUI.ini (always starts off at launch). Legacy: three
-  **checkBox_{X,Y,Z}_Enabled** still use ini **enable_X/Y/Z** if the master checkbox is absent. mA target spin
-  + Set-mA buttons per axis are optional; if absent, lcdNumber_[XYZ]_mA still update from TM:: (banding uses
-  Settings → max mA when no per-axis target; legacy objectName lcdNumber_*_Measured is still accepted). Override needs doubleSpinBox_Test_[XYZ]_V +
-  lcdNumber_[XYZ]_Test_Volts: when checked, host adjusts set_<axis>_v per enabled axis toward the Test V
-  spinbox using TM:: coil_V_*; test LCDs use green within ±0.25 V, amber below that band, red above.
+  **DROK UI widgets** follow ``Software/HostApp/calibrator_DROK_UI_RequiredChanges.txt`` (authoritative list). The host
+  does **not** wire legacy Test-V / voltage-override / Test-NULL bench widgets.
+  **Coil enable (firmware):** while Pico serial is open, the host sends **enable_x/y/z 1** on connect; on disconnect it
+  sends **enable_* 0** then **host_disconnect**. There is no separate UI axis enable — serial connection implies enabled
+  until **SAFE** or firmware clears output; reconnect serial to re-send enables after a SAFE-style disable.
+  **CalibratorUI_DROK.ui** uses **lcdNumber_[XYZ]_Coil_Current** (DROK-measured mA via Pico TM) and **lcdNumber_[XYZ]_Coil_Volts** from TM.
 
   Debug (terminal stdout): CalibratorUI.ini [debug] DEBUG = integer 0–9 (default 0).
     ``_dbg(N, ...)`` prints **only** when ``DEBUG == N`` and ``N > 0`` (exact level; no cumulative lower levels).
     One stderr line always shows ini path and effective DEBUG (even when DEBUG=0). Feature gates (TM CSV file,
     etc.) still use DEBUG thresholds documented below.
     0 = no DBG stdout. 1 = connect/disconnect, actions, serial cap trim, Pico version, widget warnings.
-    2 = Set TX echo on voltage-override sends. 3 = MT102 connect / F-cal / skip-fail lines only.
+    2 = (unused; reserved.) 3 = MT102 connect / F-cal / skip-fail lines only.
     4 = TM CSV + TM/serial chunk trace (``serial read``, ``RX (unprefixed)``, ``TM_CSV``, ``TXT``, TM-diag).
     5 = MT102: ``MagTest.xlsx`` (timestamp, coil V, RAW; Gauss columns only after factory
     F-cal loads; plus ``W901_Gauss_*`` (after ``mt102_swapped_xy``) and ``W901_Raw_Gauss_*`` (UART frame, no swap)
     from Wit901 on the same poll). No DBG5 MT102 stdout stream. Requires ``openpyxl``.
-    6 = (unused; reserved.) Former DEBUG=6 hook removed — ambient bump capture uses ``AmbianReadings.xlsx``
-    from **Test NULL** checkbox (open-loop four-step sequence), not DEBUG-gated; rows include ``W901_Gauss_*`` and
-    ``W901_Raw_Gauss_*``.
+    6 = (unused; reserved.)
 
   Run:
     pip install -r requirements.txt
@@ -126,6 +122,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QLabel,
     QLCDNumber,
     QMessageBox,
@@ -161,7 +158,7 @@ except ImportError:
 
 # --- Paths ---
 _HERE = Path(__file__).resolve().parent
-_UI_PATH = _HERE / "CalibratorUI_MOPS.ui"
+_UI_PATH = _HERE / "CalibratorUI_DROK.ui"
 _INI_PATH = _HERE / "CalibratorUI.ini"
 # DEBUG≥4: append TM snapshot rows here (CSV for Excel/plot tools; not .xls binary).
 _TM_CSV_DEBUG_MIN = 4
@@ -169,12 +166,9 @@ _MT102_TRACE_DEBUG_MIN = 5
 _TM_CSV_PATH = _HERE / "test_1.csv"
 _MAG_TEST_XLSX_PATH = _HERE / "MagTest.xlsx"
 _MAG_TEST_XLSX_SAVE_EVERY_N = 25
-# Test NULL checkbox: open-loop ambient / axis-bump capture (needs openpyxl).
-_AMBIAN_XLSX_PATH = _HERE / "AmbianReadings.xlsx"
 # External Drive mode (MT-102 + Wit901 only, no Pico): log sensor rows here for bench supply experiments.
 _EXTERNAL_DRIVE_XLSX_PATH = _HERE / "ExternalDrive.xlsx"
 _EXTERNAL_DRIVE_SAVE_EVERY_N = 25
-_TESTCAL_SETTLE_MS = 2500
 # First successful MT-102 F-cal on connect: raw payload + matrix written here (bench artifact).
 _F_BLOCK_CAPTURE_PATH = _HERE / "F_BLOCK_CAPTURE.md"
 # Project logo for Help → About (user asset); also accepts HostApp/3DHC_Logo.png as fallback.
@@ -230,10 +224,8 @@ _COIL_V_LOW_RED = 11.8
 _COIL_V_GREEN_HI = 12.3
 _COIL_V_AMBER_HI = 12.5
 
-# Voltage override test LCDs: ±this band (V) around spinbox target → green; below → amber; above → red.
-_TEST_VOLT_TOL_V = 0.25
-# When TM:: meas_ok=0 (INA read missing), cap commanded set_*_v while nudging toward target (open-loop safety).
-_VOLT_OVERRIDE_MAX_CMD_V_IF_MEAS_BAD = 3.0
+# TM ``set_*_v`` vs ``coil_V_*`` on Coil_Volts LCD when setpoint is “low”: match band (V) → green / amber / red.
+_TM_SETPOINT_MATCH_TOL_V = 0.25
 # Helmholtz pair (ideal spacing = R): axial |B| at midpoint, B = 8/(5^(3/2)) * μ0 * N * I / R [T].
 _MU0_SI = 4.0 * math.pi * 1e-7
 _HELMHOLTZ_PAIR_AXIS_CENTER_FACTOR = 8.0 / (5.0 ** 1.5)
@@ -482,6 +474,41 @@ def _setup_display_only_led(rb: QRadioButton) -> None:
     rb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
 
+# CalibratorUI_DROK.ui — display-only LED radios (not used as real radio groups).
+# objectNames must match the .ui file (includes Designer typos where applicable).
+_DROK_DISPLAY_ONLY_LED_OBJECT_NAMES: tuple[str, ...] = (
+    "radioButton_ConnnectedGaussSource",
+    "radioButton_X_Coil_LED_Connected",
+    "radioButton_X_LED_Coil_OCP",
+    "radioButton_X_Coil_LED_OVP",
+    "radioButton_X_Coil_LED_Detected",
+    "radioButton_X_Coil_LED_InvertedPolarity",
+    "radioButton_Y_Coil_LED_Connected",
+    "radioButton_Y_Coil_LED_OCP",
+    "radioButton_Y_Coil_LED_OVP",
+    "radioButton_Y_Coil_LED__Detected",
+    "radioButton_Y_Coil_LED_InvertedPolarity",
+    "radioButton_Z_Coil_LED_Connected",
+    "radioButton_Z_Coil_LED_OCP",
+    "radioButton_Z_Coil_LED_OVP",
+    "radioButton_Z_Coil_LED_Detected",
+    "radioButton_Z_Coil_LED_InvertedPolarity",
+    "radioButton_X_LED_Coil_CC",
+    "radioButton_Y_LED_Coil_CC",
+    "radioButton_Z_LED_Coil_CC",
+)
+
+
+def _setup_display_only_leds_from_names(win: QMainWindow, names: tuple[str, ...]) -> None:
+    """Apply ``_setup_display_only_led`` + gray default to each present ``QRadioButton`` (DROK UI carry-forward)."""
+    for name in names:
+        rb = win.findChild(QRadioButton, name)
+        if rb is None:
+            continue
+        _setup_display_only_led(rb)
+        _apply_led_color(rb, "gray")
+
+
 def _is_bluetooth_port(p: serial.tools.list_ports.ListPortInfo) -> bool:
     """Exclude Bluetooth virtual COM ports on Windows (and similar)."""
     desc = (p.description or "").lower()
@@ -556,9 +583,6 @@ def load_ini() -> configparser.ConfigParser:
         cp.set("settings", "pwm_freq_hz", "5000")
     if not cp.has_option("settings", "max_ma_mA"):
         cp.set("settings", "max_ma_mA", "100")
-    for _ax in ("X", "Y", "Z"):
-        if not cp.has_option("settings", f"enable_{_ax}"):
-            cp.set("settings", f"enable_{_ax}", "0")
     if not cp.has_section("debug"):
         cp.add_section("debug")
     if not cp.has_option("debug", "DEBUG"):
@@ -622,7 +646,7 @@ def save_ini(cp: configparser.ConfigParser) -> None:
 
     Before writing, merge any (section, option) that exists on disk but is missing from ``cp``.
     That way keys or whole sections added or edited while the app was running are not erased when
-    the host saves (Settings, disconnect serial, enable_*, Site Calibration, etc.).
+    the host saves (Settings, disconnect serial, Calibration menu actions, etc.).
     In-memory values always win for keys the app already holds.
     """
     if _INI_PATH.is_file():
@@ -718,14 +742,16 @@ def _volts_lcd_digit_color(v: float) -> str:
 
 
 def _coil_volts_lcd_color(meas_v: float, set_v: float | None) -> str:
-    """INA coil bus V on LCD: low commanded V → color vs set_*_v; else 12 V rail banding."""
+    """INA coil bus V on LCD: low commanded V → color vs TM set_*_v; else 12 V rail banding."""
     if set_v is not None and math.isfinite(set_v) and abs(set_v) < _COIL_V_LOW_RED:
-        return _test_volt_lcd_digit_color(meas_v, set_v, tol=_TEST_VOLT_TOL_V)
+        return _meas_vs_setpoint_volt_color(meas_v, set_v, tol=_TM_SETPOINT_MATCH_TOL_V)
     return _volts_lcd_digit_color(meas_v)
 
 
-def _test_volt_lcd_digit_color(meas: float, target: float, tol: float = _TEST_VOLT_TOL_V) -> str:
-    """Green within ±tol of target; amber when below band (too low); red when above band."""
+def _meas_vs_setpoint_volt_color(
+    meas: float, target: float, tol: float = _TM_SETPOINT_MATCH_TOL_V
+) -> str:
+    """Green within ±tol of TM setpoint; amber when below band; red when above."""
     if abs(meas - target) <= tol:
         return _MEAS_LCD_GREEN
     if meas < target - tol:
@@ -782,7 +808,7 @@ class CalibratorController:
         self._debug_level = self._read_debug_level()
         try:
             sys.stderr.write(
-                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout DBG: exact N only; TM CSV>=%d; MagTest.xlsx DEBUG==%d; AmbianReadings.xlsx on Test NULL run)\n"
+                "[CalibratorUI] UI %s ini=%s effective_DEBUG=%d (stdout DBG: exact N only; TM CSV>=%d; MagTest.xlsx DEBUG==%d)\n"
                 % (
                     CALIBRATOR_UI_VERSION,
                     _INI_PATH,
@@ -805,11 +831,6 @@ class CalibratorController:
                 sys.stderr.write(
                     "[CalibratorUI] DEBUG=%d: MT102 wide data monitor; MagTest rows -> %s (needs openpyxl)\n"
                     % (_MT102_TRACE_DEBUG_MIN, _MAG_TEST_XLSX_PATH.resolve())
-                )
-            if self._debug_level >= 1:
-                sys.stderr.write(
-                    "[CalibratorUI] Test NULL (ambient 4-step) -> %s (needs openpyxl)\n"
-                    % (_AMBIAN_XLSX_PATH.resolve(),)
                 )
             sys.stderr.flush()
         except Exception:
@@ -859,7 +880,7 @@ class CalibratorController:
                 sys.stderr.write(
                     "[CalibratorUI] WARNING: [mt102_display] mag_raw_to_gauss=%s is very large; "
                     "displayed G = corrected_counts × this (legacy 0.01 → ~40–150 G at rest). "
-                    "Try ~1e-5 or use Site Calibration → MT-102 Gauss scale. ini: %s\n"
+                    "Try ~1e-5 or adjust Gauss CalFactor / mag_raw_to_gauss in ini. ini: %s\n"
                     % (self._mag_raw_to_gauss, _INI_PATH.resolve())
                 )
             except Exception:
@@ -873,61 +894,48 @@ class CalibratorController:
         self._mt102_field_gauss_lcds: list[tuple[QLCDNumber, str]] | None = None
         # User-added Wit901 Gauss readouts: QLCDNumber and/or QLabel per axis.
         self._wit901_field_gauss_lcds: list[tuple[QWidget, str]] | None = None
+        # True after Wit901MagReader.connect succeeds (used for Gauss source combo).
+        self._wit901_uart_open: bool = False
+        # CalibratorUI_DROK.ui: Axis Gauss readouts = (MT102 or Wit901) × cal factor.
+        self._drok_axis_gauss_lcds: list[tuple[str, QLCDNumber]] = []
+        self._gauss_cal_spins: dict[str, QDoubleSpinBox] = {}
+        self._gauss_combo_seeded: bool = False
+        self._last_mt102_field_gauss: tuple[float, float, float, bool] = (
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            False,
+        )
         self._mag_test_wb: object | None = None
         self._mag_test_ws: object | None = None
         self._mag_test_xlsx_row_count = 0
         self._mag_test_xlsx_missing_logged = False
-        self._ambian_wb: object | None = None
-        self._ambian_ws: object | None = None
-        self._ambian_missing_logged = False
         self._external_drive_wb: object | None = None
         self._external_drive_ws: object | None = None
         self._external_drive_row_count = 0
         self._external_drive_active = False
-        self._testcal_chk: QCheckBox | None = win.findChild(QCheckBox, "checkBox_TestNull")
-        self._testcal_active = False
-        self._testcal_prev_override_checked = False
-        self._testcal_after_apply_index = 0
-        self._testcal_vx = 0.0
-        self._testcal_vy = 0.0
-        self._testcal_vz = 0.0
-        self._testcal_timer = QTimer(self._win)
-        self._testcal_timer.setSingleShot(True)
-        self._testcal_timer.timeout.connect(self._testcal_on_settle)
 
         self._combo_port = win.findChild(QComboBox, "comboBox_CalibratorPort")
         self._combo_baud = win.findChild(QComboBox, "comboBox_CalbratorBaud")
         self._btn_connect = win.findChild(QPushButton, "pushButton_ConnectAll")
-        self._led_connected = win.findChild(QRadioButton, "radioButton_Connected")
-        self._led_configured = win.findChild(QRadioButton, "radioButton_Configured")
-        self._led_closed_loop = win.findChild(QRadioButton, "radioButton_ClosedLoop")
-        self._led_initialized = win.findChild(QRadioButton, "radioButton_Initialized")
-        self._led_dc_state = win.findChild(QRadioButton, "radioButton_DCState")
         self._led_f_cal_applied: QRadioButton | None = win.findChild(
             QRadioButton, "radioButton_F_CalApplied"
         )
         self._text_out = win.findChild(QTextEdit, "textEdit_CalibratorTestOutput")
         self._btn_clear_text = win.findChild(QPushButton, "pushButton_ClearCalibratorText")
 
-        # Master coil enable (optional): one checkbox → firmware enable_x/y/z same state.
-        self._master_coils_enable: QCheckBox | None = win.findChild(
-            QCheckBox, "checkBox_TestVoltageSetting"
-        )
         self._axis_rows: list[
             tuple[str, QSpinBox | None, QPushButton | None, QLCDNumber, QCheckBox | None]
         ] = []
         for ax in ("X", "Y", "Z"):
-            sp = win.findChild(QSpinBox, f"spinBox_{ax}mA_target")
-            pb = win.findChild(QPushButton, f"pushButton_{ax}_Set_mA")
-            lcd = win.findChild(QLCDNumber, f"lcdNumber_{ax}_mA")
-            if lcd is None:
-                lcd = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Measured")
-            chk = win.findChild(QCheckBox, f"checkBox_{ax}_Enabled")
+            lcd = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Coil_Current")
             if not lcd:
                 raise RuntimeError(
-                    f"UI missing measured mA LCD for axis {ax} "
-                    f"(lcdNumber_{ax}_mA, or legacy lcdNumber_{ax}_Measured)"
+                    "CalibratorUI_DROK.ui: missing lcdNumber_%s_Coil_Current" % ax
                 )
+            sp = win.findChild(QSpinBox, f"spinBox_{ax}mA_target")
+            pb = win.findChild(QPushButton, f"pushButton_{ax}_Set_mA")
+            chk = win.findChild(QCheckBox, f"checkBox_{ax}_Enabled")
             _init_measured_ma_lcd(lcd)
             if sp is not None:
                 sp.setRange(0, 5000)
@@ -935,47 +943,39 @@ class CalibratorController:
             if chk is not None:
                 chk.setChecked(False)
             self._axis_rows.append((ax, sp, pb, lcd, chk))
-        if self._master_coils_enable is None:
-            for ax, _sp, _pb, _lcd, chk in self._axis_rows:
-                if chk is None:
-                    raise RuntimeError(
-                        "UI: add checkBox_TestVoltageSetting (master enable) or keep checkBox_X/Y/Z_Enabled per axis."
-                    )
-        else:
-            self._master_coils_enable.setToolTip(
-                "Master: enables or disables all three coil drivers on the Pico (enable_x, enable_y, enable_z). "
-                "Not saved in CalibratorUI.ini — always off when the app starts."
-            )
 
         self._axis_volts_lcd: list[tuple[str, QLCDNumber]] = []
         for ax in ("X", "Y", "Z"):
-            vlcd = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Volts")
+            vlcd = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Coil_Volts")
             if not vlcd:
                 raise RuntimeError(
-                    f"UI missing coil volts LCD for axis {ax} (lcdNumber_{ax}_Volts)"
+                    "CalibratorUI_DROK.ui: missing lcdNumber_%s_Coil_Volts" % ax
                 )
             _init_volts_lcd(vlcd)
             self._axis_volts_lcd.append((ax, vlcd))
 
         self._axis_gauss_lcd: list[tuple[str, QLCDNumber]] = []
-        _g_x = win.findChild(QLCDNumber, "lcdNumber_X_Gauss")
-        _g_y = win.findChild(QLCDNumber, "lcdNumber_Y_Gauss")
-        _g_z = win.findChild(QLCDNumber, "lcdNumber_Z_Gauss")
-        if _g_x and _g_y and _g_z:
-            for ax, glcd in (("X", _g_x), ("Y", _g_y), ("Z", _g_z)):
-                _init_gauss_lcd(glcd)
-                glcd.setToolTip(
-                    "|B| (Gauss) at Helmholtz midpoint: ini [helmholtz] "
-                    f"{ax.lower()}_diameter_mm, {ax.lower()}_turns. "
-                    "Current for the model uses I=|V|/R from TM coil_V or set_*_v and "
-                    f"{ax.lower()}_r_ohm when set; else TM measured mA. Refreshes every telemetry line."
+
+        self._combo_gauss_source = win.findChild(QComboBox, "comboBox_SelectedGaussSource")
+        if self._combo_gauss_source is not None:
+            self._combo_gauss_source.setEnabled(False)
+        for ax in ("X", "Y", "Z"):
+            gsp = win.findChild(QDoubleSpinBox, f"doubleSpinBox_{ax}_Gauss_CalFactor")
+            if gsp is not None:
+                self._gauss_cal_spins[ax] = gsp
+        for ax in ("X", "Y", "Z"):
+            ag = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Axis_Gauss")
+            if ag is not None:
+                _init_gauss_lcd(ag)
+                self._drok_axis_gauss_lcds.append((ax, ag))
+        if self._combo_gauss_source is not None and self._drok_axis_gauss_lcds:
+            self._combo_gauss_source.currentIndexChanged.connect(
+                lambda _i: self._refresh_drok_axis_gauss_lcds(
+                    self._last_mt102_field_gauss[3],
+                    self._last_mt102_field_gauss[0],
+                    self._last_mt102_field_gauss[1],
+                    self._last_mt102_field_gauss[2],
                 )
-                self._axis_gauss_lcd.append((ax, glcd))
-        elif _g_x or _g_y or _g_z:
-            self._dbg(
-                1,
-                "Gauss LCDs incomplete (need lcdNumber_X_Gauss, lcdNumber_Y_Gauss, "
-                "lcdNumber_Z_Gauss); field estimate disabled",
             )
 
         self._null_frame: QFrame | None = None
@@ -998,86 +998,9 @@ class CalibratorController:
                 "Null indicator incomplete (need frame_NullIndicator and label_NullIndicatorText).",
             )
 
-        # Optional: voltage override (Designer objectNames must match exactly).
-        self._volt_override_chk: QCheckBox | None = None
-        self._volt_override_spins: dict[str, QDoubleSpinBox] = {}
-        self._volt_override_lcds: dict[str, QLCDNumber] = {}
-        self._volt_ov_cmd_v: dict[str, float] = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        vo_chk = win.findChild(QCheckBox, "checkBox_TestVoltageSetting")
-        vo_spins: dict[str, QDoubleSpinBox | None] = {}
-        vo_lcds: dict[str, QLCDNumber | None] = {}
-        for ax in ("X", "Y", "Z"):
-            vo_spins[ax] = win.findChild(QDoubleSpinBox, f"doubleSpinBox_Test_{ax}_V")
-            vo_lcds[ax] = win.findChild(QLCDNumber, f"lcdNumber_{ax}_Test_Volts")
-        if (
-            vo_chk
-            and all(vo_spins[a] is not None for a in ("X", "Y", "Z"))
-            and all(vo_lcds[a] is not None for a in ("X", "Y", "Z"))
-        ):
-            self._volt_override_chk = vo_chk
-            for ax in ("X", "Y", "Z"):
-                sp = vo_spins[ax]
-                lc = vo_lcds[ax]
-                assert sp is not None and lc is not None
-                self._volt_override_spins[ax] = sp
-                self._volt_override_lcds[ax] = lc
-                sp.setRange(0.0, 20.0)
-                sp.setDecimals(2)
-                sp.setSingleStep(0.1)
-                sp.setValue(0.0)
-                _init_volts_lcd(lc)
-            if vo_chk is self._master_coils_enable:
-                vo_chk.setToolTip(
-                    "Master enable for all three coil drivers (enable_x/y/z). With Test V widgets present: "
-                    "host sends set_<axis>_v toward doubleSpinBox_Test_*_V using TM:: coil_V_*; test LCDs "
-                    "green within ±0.25 V, amber below, red above."
-                )
-            else:
-                vo_chk.setToolTip(
-                    "Override: host sends set_<axis>_v toward doubleSpinBox_Test_*_V using TM:: coil_V_* "
-                    "when coils are enabled. Green within ±0.25 V; amber below; red above."
-                )
-            vo_chk.stateChanged.connect(self._on_volt_override_chk_changed)
-        elif vo_chk or any(vo_spins.values()) or any(vo_lcds.values()):
-            self._dbg(
-                1,
-                "Voltage override widgets incomplete (need checkBox_TestVoltageSetting, "
-                "doubleSpinBox_Test_X_V / _Y_ / _Z_, lcdNumber_X_Test_Volts / _Y_ / _Z_); "
-                "override disabled",
-            )
-
-        self._btn_set_coil_v: QPushButton | None = win.findChild(
-            QPushButton, "pushButton_Set_Coil_Voltages"
-        )
-        if (
-            self._btn_set_coil_v is not None
-            and self._volt_override_chk is not None
-            and len(self._volt_override_spins) == 3
-        ):
-            self._btn_set_coil_v.setToolTip(
-                "Apply all three doubleSpinBox_Test_[XYZ]_V values to the Pico (set_x_v / set_y_v / set_z_v). "
-                "Voltage override must be on."
-            )
-            self._btn_set_coil_v.clicked.connect(self._on_set_coil_voltages_clicked)
-        elif self._btn_set_coil_v is not None:
-            self._dbg(
-                1,
-                "pushButton_Set_Coil_Voltages ignored until voltage override widget set is complete.",
-            )
-
         if not self._combo_port or not self._combo_baud or not self._btn_connect:
             raise RuntimeError(
                 "UI missing widgets: comboBox_CalibratorPort, comboBox_CalbratorBaud, pushButton_ConnectAll"
-            )
-        if (
-            not self._led_connected
-            or not self._led_configured
-            or not self._led_closed_loop
-            or not self._led_initialized
-            or not self._led_dc_state
-        ):
-            raise RuntimeError(
-                "UI missing status LEDs: Connected, Configured, ClosedLoop, Initialized, DCState"
             )
         if not self._text_out or not self._btn_clear_text:
             raise RuntimeError(
@@ -1091,7 +1014,6 @@ class CalibratorController:
         # Last (display_text, stylesheet) per QLCDNumber — skip redundant setStyleSheet (expensive at TM rate).
         self._lcd_meas_cache: dict[str, tuple[str, str]] = {}
         self._lcd_volts_cache: dict[str, tuple[str, str]] = {}
-        self._lcd_test_volts_cache: dict[str, tuple[str, str]] = {}
         self._lcd_gauss_cache: dict[str, tuple[str, str]] = {}
         # (coil radius_m, N turns) per axis from [helmholtz]; None → show --- on Gauss LCD.
         self._helm_geom: dict[str, tuple[float, float] | None] = {
@@ -1099,30 +1021,30 @@ class CalibratorController:
             "Y": None,
             "Z": None,
         }
-        # DC coil resistance (Ω) per axis for I≈|V|/R when TM gives coil_V_* or set_*_v (Gauss drive current).
-        self._helm_r_ohm: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
         self._connect_rx_pump_slices: int = 0
         self._serial_timer = QTimer(self._win)
         self._serial_timer.setInterval(50)
         self._serial_timer.timeout.connect(self._poll_serial)
 
-        for rb in (
-            self._led_connected,
-            self._led_configured,
-            self._led_closed_loop,
-            self._led_initialized,
-            self._led_dc_state,
-        ):
-            _setup_display_only_led(rb)
         if self._led_f_cal_applied is not None:
             _setup_display_only_led(self._led_f_cal_applied)
             _apply_led_color(self._led_f_cal_applied, "gray")
+
+        _setup_display_only_leds_from_names(win, _DROK_DISPLAY_ONLY_LED_OBJECT_NAMES)
+
+        # DROK CC status (TM:: drok_cc_led + drok_axis); widgets in CalibratorUI_DROK.ui radioButton_[XYZ]_LED_Coil_CC.
+        self._led_cc_coil: dict[str, QRadioButton] = {}
+        for ax in ("X", "Y", "Z"):
+            rb_cc = win.findChild(QRadioButton, "radioButton_%s_LED_Coil_CC" % ax)
+            if rb_cc is not None:
+                _apply_led_color(rb_cc, "red")
+                self._led_cc_coil[ax] = rb_cc
 
         self._status_main = QLabel("")
         self._status_conn = QLabel("Connection: Disconnected")
         self._btn_reset = QPushButton("Reset")
         self._btn_reset.setToolTip(
-            "Send safe_reset: Pico drives all coil PWM lines off (same shutdown as SAFE). Clears host fault LED."
+            "Send safe_reset when the connected firmware supports it (coil / output shutdown)."
         )
         sb = win.statusBar()
         sb.addWidget(self._status_main, 1)
@@ -1138,7 +1060,7 @@ class CalibratorController:
         self._setup_settings_menu()
         self._sync_soft_reset_menu_from_ini()
         self._setup_help_menu()
-        self._setup_site_calibration_menu()
+        self._setup_calibration_menu()
 
         self._btn_connect.clicked.connect(self._on_connect_clicked)
         self._chk_external_drive: QCheckBox | None = win.findChild(
@@ -1159,24 +1081,6 @@ class CalibratorController:
             _btn_mt102_clear.clicked.connect(self._on_clear_mt102_data)
         self._combo_port.currentIndexChanged.connect(self._on_serial_widget_changed)
         self._combo_baud.currentIndexChanged.connect(self._on_serial_widget_changed)
-
-        if self._master_coils_enable is not None:
-            self._master_coils_enable.stateChanged.connect(
-                self._on_master_coils_enable_changed
-            )
-        if self._testcal_chk is not None:
-            self._testcal_chk.setToolTip(
-                "Test NULL (ambient capture): open-loop four steps — all set_*_v 0, then X-only, Y-only, Z-only "
-                "voltages from the Test V spinboxes. After each step waits %d ms, logs MT-102 Gauss/RAW to "
-                "%s (needs openpyxl). No closed-loop null. Supersedes voltage override while running; SAFE when unchecked."
-                % (_TESTCAL_SETTLE_MS, _AMBIAN_XLSX_PATH.name)
-            )
-            self._testcal_chk.stateChanged.connect(self._on_test_null_changed)
-        for ax, _sp, pb, _lcd, chk in self._axis_rows:
-            if pb is not None:
-                pb.clicked.connect(lambda checked=False, a=ax: self._on_set_axis_ma(a))
-            if chk is not None and self._master_coils_enable is None:
-                chk.stateChanged.connect(lambda _st, a=ax: self._on_axis_enable_changed(a))
 
         self._set_connected_ui(False)
         self._set_status("Ready.")
@@ -1225,47 +1129,20 @@ class CalibratorController:
         if m not in valid:
             m = min(valid, key=lambda x: abs(x - m))
         self._settings_max_ma = m
-        if self._master_coils_enable is not None:
-            # Safety: never restore master enable from ini — always start unchecked.
-            self._master_coils_enable.blockSignals(True)
-            self._master_coils_enable.setChecked(False)
-            self._master_coils_enable.blockSignals(False)
-        else:
-            for ax, _sp, _pb, _lcd, chk in self._axis_rows:
-                if chk is None:
-                    continue
-                raw = self._ini.get("settings", f"enable_{ax}", fallback="0").strip()
-                on = raw in ("1", "true", "True", "yes", "YES", "on", "ON")
-                chk.blockSignals(True)
-                chk.setChecked(on)
-                chk.blockSignals(False)
-
     def _coils_axis_enabled(self, axis: str) -> bool:
-        """True if this logical axis is considered enabled for serial / UI (master or per-axis)."""
-        if self._master_coils_enable is not None:
-            return self._master_coils_enable.isChecked()
-        row = next((r for r in self._axis_rows if r[0] == axis), None)
-        if row is None:
-            return False
-        chk = row[4]
-        return bool(chk is not None and chk.isChecked())
+        """True when Pico serial is open — connection implies coil axes are enabled for host/firmware sync."""
+        _ = axis
+        return self._serial is not None
 
     def _reload_helmholtz_geometry(self) -> None:
-        """Read [helmholtz] x_diameter_mm, x_turns, x_r_ohm, … for Gauss estimate and I=|V|/R."""
+        """Read [helmholtz] x_diameter_mm, x_turns, … for Helmholtz |B| model (current always from TM mA)."""
         sec = "helmholtz"
         for ax in ("X", "Y", "Z"):
             self._helm_geom[ax] = None
-            self._helm_r_ohm[ax] = None
         if not self._ini.has_section(sec):
             return
         for ax in ("X", "Y", "Z"):
             al = ax.lower()
-            try:
-                ro = float(self._ini.get(sec, f"{al}_r_ohm", fallback="0").strip())
-            except ValueError:
-                ro = 0.0
-            if ro > 0.0:
-                self._helm_r_ohm[ax] = ro
             try:
                 d_mm = float(
                     self._ini.get(sec, f"{al}_diameter_mm", fallback="0").strip()
@@ -1286,12 +1163,6 @@ class CalibratorController:
     def _settings_persist_to_ini(self) -> None:
         self._ini.set("settings", "pwm_freq_hz", str(self._settings_pwm_hz))
         self._ini.set("settings", "max_ma_mA", str(self._settings_max_ma))
-        # Master enable is not written to ini (safety). Legacy per-axis checkboxes still persist enable_*.
-        if self._master_coils_enable is None:
-            for ax, _sp, _pb, _lcd, chk in self._axis_rows:
-                if chk is None:
-                    continue
-                self._ini.set("settings", f"enable_{ax}", "1" if chk.isChecked() else "0")
         mb = self._win.menuBar()
         for a in mb.actions():
             m = a.menu()
@@ -1532,53 +1403,6 @@ class CalibratorController:
             self._settings_persist_to_ini()
             self._set_status(f"Max current set to {self._settings_max_ma:.0f} mA (saved).")
 
-    def _settings_dialog_mt102_gauss_scale(self) -> None:
-        """Edit [mt102_display] mag_raw_to_gauss; save to CalibratorUI.ini on OK."""
-        dlg = QDialog(self._win)
-        dlg.setWindowTitle("MT-102 Gauss scale")
-        dlg.setModal(True)
-        lay = QVBoxLayout(dlg)
-        info = QLabel(
-            "Displayed Gauss = (factory F-corrected count, MagnetometerParser-style) × this factor. "
-            "Written to CalibratorUI.ini section [mt102_display] key mag_raw_to_gauss. "
-            "Tune at a fixed pose using a NIST-traceable Gaussmeter."
-        )
-        info.setWordWrap(True)
-        lay.addWidget(info)
-        form = QFormLayout()
-        sp = QDoubleSpinBox()
-        sp.setRange(1e-15, 1.0)
-        sp.setDecimals(12)
-        sp.setSingleStep(1e-8)
-        sp.setValue(float(self._mag_raw_to_gauss))
-        sp.setToolTip(
-            "Order-of-magnitude starting point after parser fix is often ~1e-5; "
-            "adjust until host Gauss matches your reference probe."
-        )
-        form.addRow("mag_raw_to_gauss:", sp)
-        lay.addLayout(form)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        lay.addWidget(buttons)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        v = float(sp.value())
-        if not math.isfinite(v) or v <= 0.0:
-            self._set_status("MT-102 Gauss scale: invalid value (ignored).")
-            return
-        if not self._ini.has_section("mt102_display"):
-            self._ini.add_section("mt102_display")
-        self._ini.set("mt102_display", "mag_raw_to_gauss", format(v, ".15g"))
-        save_ini(self._ini)
-        self._mag_raw_to_gauss = v
-        self._set_status(
-            "MT-102 Gauss scale saved: mag_raw_to_gauss = %s (CalibratorUI.ini)."
-            % (format(v, ".15g"),)
-        )
-
     def _find_menu_by_object_name(self, object_name: str) -> QMenu | None:
         """
         Return a ``QMenu`` by Designer ``objectName``.
@@ -1598,23 +1422,31 @@ class CalibratorController:
                 return sub
         return None
 
-    def _setup_site_calibration_menu(self) -> None:
-        """Add Site Calibration menu actions (Gaussmeter / MT-102 scale). Requires ``menuSite_Calibration`` in .ui."""
-        menu = self._find_menu_by_object_name("menuSite_Calibration")
+    def _setup_calibration_menu(self) -> None:
+        """Top menu **Calibration**: cross-coupling matrix generator (Gauss CalFactor is on the main form).
+
+        Resolves ``menuCalibration`` (preferred) or legacy ``menuSite_Calibration`` from Designer.
+        """
+        menu = self._find_menu_by_object_name("menuCalibration")
+        if menu is None:
+            menu = self._find_menu_by_object_name("menuSite_Calibration")
         if menu is None:
             self._dbg(
                 1,
-                "UI: no menubar menu for objectName menuSite_Calibration (set on QAction or QMenu) — "
-                "Site Calibration entries not added.",
+                "UI: no menubar QMenu for objectName menuCalibration or menuSite_Calibration — "
+                "Calibration entries not added.",
             )
             return
-        self._ensure_menu_action_on_menu(
-            menu, "MT-102 Gauss scale...", self._settings_dialog_mt102_gauss_scale
-        )
+        mb = self._win.menuBar()
+        for a in mb.actions():
+            if a.menu() is menu:
+                a.setText("Calibration")
+                break
+        menu.setTitle("Calibration")
         self._ensure_menu_action_on_menu(
             menu,
-            "Align MT-102 scale to reference meter...",
-            self._dialog_align_mt102_scale_to_reference,
+            "Generate cross-coupling matrix…",
+            self._dialog_generate_cross_coupling_matrix,
         )
 
     @staticmethod
@@ -1625,123 +1457,195 @@ class CalibratorController:
         act.triggered.connect(slot)
         menu.addAction(act)
 
-    def _dialog_align_mt102_scale_to_reference(self) -> None:
-        """
-        Set mag_raw_to_gauss from a NIST-traceable reading: new_scale = old_scale × (B_ref / B_host)
-        for the chosen component or |B|.
-        """
+    def _read_mt102_gauss_triple_now(self) -> tuple[float, float, float] | None:
+        """Return (Gx, Gy, Gz) from the connected MT-102, or ``None`` if unavailable."""
         if MT102Interface is None or not getattr(self, "_mt102", None) or self._mt102 is None:
-            QMessageBox.warning(self._win, "Site Calibration", "MT-102 is not connected.")
-            return
+            return None
         if not self._mt102.is_connected():
-            QMessageBox.warning(self._win, "Site Calibration", "MT-102 is not connected.")
-            return
+            return None
         try:
             cal = self._mt102.get_cal_data()
             mag = self._mt102.get_mag_data(timeout=0)
-        except Exception as e:
-            QMessageBox.warning(self._win, "Site Calibration", str(e))
-            return
+        except Exception:
+            return None
         if cal is None or mag is None:
-            QMessageBox.warning(
-                self._win,
-                "Site Calibration",
-                "Need factory F-cal and a fresh M packet (connect MT-102, wait for samples).",
-            )
-            return
+            return None
         try:
             gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
-        except Exception as e:
-            QMessageBox.warning(self._win, "Site Calibration", str(e))
-            return
+        except Exception:
+            return None
         if not all(math.isfinite(v) for v in (gx, gy, gz)):
-            QMessageBox.warning(
-                self._win, "Site Calibration", "Current Gauss values are not finite."
-            )
-            return
-        b_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
+            return None
+        return (float(gx), float(gy), float(gz))
 
+    def _dialog_generate_cross_coupling_matrix(self) -> None:
+        """
+        Build the 3×3 coil cross-coupling matrix **M** (T/A): ``B_T = M @ I`` with ``I`` in amperes.
+
+        For each isolated drive (X, then Y, then Z), set **I** (A) to that axis’s **Pico TM DROK-measured** coil
+        current: **I = (Pico TM DROK-reported mA for that axis) / 1000**, i.e. the **Coil Current** LCD for that axis
+        at the time of the B reading — and enter the measured ``B`` in Gauss;
+        column *i* of ``M`` is ``(B_x, B_y, B_z)`` in tesla divided by ``I_i``.
+        Saves ``[coil_cross_coupling]`` keys ``k_xx`` … ``k_zz`` in ``CalibratorUI.ini``.
+        """
         dlg = QDialog(self._win)
-        dlg.setWindowTitle("Align MT-102 scale to reference meter")
+        dlg.setWindowTitle("Generate cross-coupling matrix")
         dlg.setModal(True)
-        lay = QVBoxLayout(dlg)
+        outer = QVBoxLayout(dlg)
         info = QLabel(
-            "Uses one simultaneous reading: host Gauss (from current mag_raw_to_gauss) vs your "
-            "calibrated Gaussmeter. Enter the reference using the same axis sign as the host for "
-            "X/Y/Z, or a non-negative |B| for magnitude. "
-            "New scale = old_scale × (B_ref ÷ B_host) for the chosen quantity."
+            "Drive one axis at a time with all others at 0 A. For each row, set I (A) = that axis’s Pico TM "
+            "DROK-reported coil current in mA ÷ 1000 (same as the Coil Current LCD at your reading). "
+            "Enter the MT-102 field (Gauss) in the same axis frame. "
+            "Column i of M (T/A) is "
+            "(B_x, B_y, B_z) in tesla divided by I for that drive. Optional: fill B from the live MT-102."
         )
         info.setWordWrap(True)
-        lay.addWidget(info)
-        cur = QLabel(
-            "Host (now):  Gx=%.6f  Gy=%.6f  Gz=%.6f  |B|=%.6f G"
-            % (gx, gy, gz, b_mag)
-        )
-        cur.setStyleSheet("font-family: monospace;")
-        lay.addWidget(cur)
-        form = QFormLayout()
-        combo = QComboBox()
-        combo.addItem("X component (Gx)", "X")
-        combo.addItem("Y component (Gy)", "Y")
-        combo.addItem("Z component (Gz)", "Z")
-        combo.addItem("|B| magnitude", "M")
-        form.addRow("Match:", combo)
-        ref_sp = QDoubleSpinBox()
-        ref_sp.setRange(-100.0, 100.0)
-        ref_sp.setDecimals(6)
-        ref_sp.setSingleStep(0.000001)
-        ref_sp.setValue(0.0)
-        ref_sp.setToolTip("Reading from your traceable Gaussmeter at this instant (Gauss).")
-        form.addRow("Reference Gauss:", ref_sp)
-        lay.addLayout(form)
+        outer.addWidget(info)
+
+        grid = QGridLayout()
+        headers = ("Drive", "I (A)", "Bx (G)", "By (G)", "Bz (G)", "")
+        for c, h in enumerate(headers):
+            if h:
+                grid.addWidget(QLabel(h), 0, c)
+        labels = ("X only", "Y only", "Z only")
+        i_spins: list[QDoubleSpinBox] = []
+        bx_spins: list[QDoubleSpinBox] = []
+        by_spins: list[QDoubleSpinBox] = []
+        bz_spins: list[QDoubleSpinBox] = []
+        for r, lab in enumerate(labels, start=1):
+            grid.addWidget(QLabel(lab), r, 0)
+            sp_i = QDoubleSpinBox()
+            sp_i.setRange(-200.0, 200.0)
+            sp_i.setDecimals(6)
+            sp_i.setSingleStep(0.001)
+            sp_i.setValue(0.0)
+            grid.addWidget(sp_i, r, 1)
+            i_spins.append(sp_i)
+            row_b = []
+            for _ in range(3):
+                sp_b = QDoubleSpinBox()
+                sp_b.setRange(-1.0e6, 1.0e6)
+                sp_b.setDecimals(6)
+                sp_b.setSingleStep(0.1)
+                sp_b.setValue(0.0)
+                row_b.append(sp_b)
+            grid.addWidget(row_b[0], r, 2)
+            grid.addWidget(row_b[1], r, 3)
+            grid.addWidget(row_b[2], r, 4)
+            bx_spins.append(row_b[0])
+            by_spins.append(row_b[1])
+            bz_spins.append(row_b[2])
+            btn = QPushButton("Fill B from MT-102")
+            row_idx = r - 1
+
+            def _make_fill(idx: int) -> Callable[[], None]:
+                def _go() -> None:
+                    g = self._read_mt102_gauss_triple_now()
+                    if g is None:
+                        QMessageBox.warning(
+                            self._win,
+                            "Calibration",
+                            "MT-102 is not connected or has no fresh Gauss reading.",
+                        )
+                        return
+                    bx_spins[idx].setValue(g[0])
+                    by_spins[idx].setValue(g[1])
+                    bz_spins[idx].setValue(g[2])
+
+                return _go
+
+            btn.clicked.connect(_make_fill(row_idx))
+            grid.addWidget(btn, r, 5)
+
+        outer.addLayout(grid)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        lay.addWidget(buttons)
+        outer.addWidget(buttons)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        mode = combo.currentData()
-        ref = float(ref_sp.value())
-        if not math.isfinite(ref):
-            QMessageBox.warning(self._win, "Site Calibration", "Invalid reference value.")
-            return
-        if mode == "X":
-            host = gx
-        elif mode == "Y":
-            host = gy
-        elif mode == "Z":
-            host = gz
-        else:
-            host = b_mag
-            if ref < 0.0:
+
+        eps_i = 1e-12
+        cols: list[tuple[float, float, float]] = []
+        for idx in range(3):
+            I = float(i_spins[idx].value())
+            if not math.isfinite(I) or abs(I) < eps_i:
                 QMessageBox.warning(
                     self._win,
-                    "Site Calibration",
-                    "For |B|, enter a non-negative reference magnitude.",
+                    "Calibration",
+                    "Each drive row needs a non-zero, finite current (A).",
                 )
                 return
-        if abs(host) < 1e-30:
-            QMessageBox.warning(
-                self._win,
-                "Site Calibration",
-                "Host value for the chosen quantity is ~0; cannot compute scale (try another axis or pose).",
+            bx = float(bx_spins[idx].value())
+            by = float(by_spins[idx].value())
+            bz = float(bz_spins[idx].value())
+            if not all(math.isfinite(v) for v in (bx, by, bz)):
+                QMessageBox.warning(
+                    self._win,
+                    "Calibration",
+                    "All Gauss entries must be finite.",
+                )
+                return
+            tx = bx * 1.0e-4
+            ty = by * 1.0e-4
+            tz = bz * 1.0e-4
+            cols.append((tx / I, ty / I, tz / I))
+
+        k_xx, k_yx, k_zx = cols[0]
+        k_xy, k_yy, k_zy = cols[1]
+        k_xz, k_yz, k_zz = cols[2]
+
+        def _det3(
+            a00: float,
+            a01: float,
+            a02: float,
+            a10: float,
+            a11: float,
+            a12: float,
+            a20: float,
+            a21: float,
+            a22: float,
+        ) -> float:
+            return (
+                a00 * (a11 * a22 - a12 * a21)
+                - a01 * (a10 * a22 - a12 * a20)
+                + a02 * (a10 * a21 - a11 * a20)
             )
+
+        det_m = _det3(k_xx, k_xy, k_xz, k_yx, k_yy, k_yz, k_zx, k_zy, k_zz)
+        if not math.isfinite(det_m):
+            QMessageBox.warning(self._win, "Calibration", "Matrix determinant is not finite.")
             return
-        old = float(self._mag_raw_to_gauss)
-        new_scale = old * (ref / host)
-        if not math.isfinite(new_scale) or new_scale <= 0.0:
-            QMessageBox.warning(self._win, "Site Calibration", "Computed scale is invalid.")
-            return
-        if not self._ini.has_section("mt102_display"):
-            self._ini.add_section("mt102_display")
-        self._ini.set("mt102_display", "mag_raw_to_gauss", format(new_scale, ".15g"))
+
+        sec = "coil_cross_coupling"
+        if not self._ini.has_section(sec):
+            self._ini.add_section(sec)
+        pairs = (
+            ("k_xx", k_xx),
+            ("k_xy", k_xy),
+            ("k_xz", k_xz),
+            ("k_yx", k_yx),
+            ("k_yy", k_yy),
+            ("k_yz", k_yz),
+            ("k_zx", k_zx),
+            ("k_zy", k_zy),
+            ("k_zz", k_zz),
+        )
+        for key, val in pairs:
+            self._ini.set(sec, key, format(val, ".15g"))
         save_ini(self._ini)
-        self._mag_raw_to_gauss = new_scale
         self._set_status(
-            "Site Calibration: mag_raw_to_gauss = %s (was %s). Saved to CalibratorUI.ini."
-            % (format(new_scale, ".15g"), format(old, ".15g"))
+            "Calibration: saved [coil_cross_coupling] k_xx…k_zz (T/A). det(M) = %s"
+            % format(det_m, ".6g")
+        )
+        QMessageBox.information(
+            self._win,
+            "Calibration",
+            "Cross-coupling matrix M (T/A) saved to CalibratorUI.ini under [coil_cross_coupling].\n\n"
+            "det(M) = %s\n\n"
+            "Use I = M⁻¹ B with B in tesla when inverting." % format(det_m, ".6g"),
         )
 
     def _refresh_com_ports(self, select_saved: bool = False) -> None:
@@ -1899,7 +1803,7 @@ class CalibratorController:
         return bool(
             re.search(
                 r"(?:^|\s)(?:meas_ok|X_ma|Y_ma|Z_ma|set_[XYZ]_v|closed_loop|coil_V_[XYZ]|"
-                r"ina_[XYZ]_ch|diag_Ch[123]_ma|diag_[XYZ]_duty|alarm)\s*=",
+                r"ina_[XYZ]_ch|diag_Ch[123]_ma|diag_[XYZ]_duty|alarm|drok_cc_led|drok_axis)\s*=",
                 t,
             )
         )
@@ -1961,26 +1865,24 @@ class CalibratorController:
             return None
 
     def _tm_measured_ma(self, kv: dict[str, str], ax: str) -> float | None:
-        """Logical-axis mA from TM:: X_ma/Y_ma/Z_ma, else same sample via diag_Ch1/2/3_ma + ina_*_ch (firmware 3.35+)."""
+        """Logical-axis mA from Pico TM (DROK PSU measurement): X_ma/Y_ma/Z_ma, else measured_ma + drok_axis, else diag shunts."""
         m = self._tm_float(kv, f"{ax}_ma")
         if m is not None:
             return m
+        m0 = self._tm_float(kv, "measured_ma")
+        if m0 is not None:
+            dax = (kv.get("drok_axis") or kv.get("DROK_AXIS") or "").strip().upper()[:1]
+            if not dax:
+                return m0
+            if dax == ax.strip().upper()[:1]:
+                return m0
         ch = self._tm_int(kv, f"ina_{ax}_ch")
         if ch is None or ch < 0 or ch > 2:
             return None
         return self._tm_float(kv, "diag_Ch%d_ma" % (ch + 1))
 
     def _tm_axis_current_a_for_gauss(self, kv: dict[str, str], ax: str) -> float | None:
-        """Axis current (A) for Helmholtz |B| model: I=|V|/R from TM when [helmholtz] *_r_ohm set, else TM mA."""
-        r_ohm = self._helm_r_ohm.get(ax)
-        if r_ohm is not None and r_ohm > 0.0:
-            v = self._tm_float(kv, f"coil_V_{ax}")
-            if v is None or not math.isfinite(v):
-                v = self._tm_float(kv, f"set_{ax}_v")
-            if v is not None and math.isfinite(v):
-                i_calc = abs(float(v)) / float(r_ohm)
-                if math.isfinite(i_calc):
-                    return float(i_calc)
+        """Axis current (A) through the coil for the Helmholtz |B| model: always TM mA from DROK (Pico), never V/R on the host."""
         m_ma = self._tm_measured_ma(kv, ax)
         if m_ma is None:
             return None
@@ -2155,7 +2057,7 @@ class CalibratorController:
             self._dbg(_TM_CSV_DEBUG_MIN, "TM CSV: row failed:", e)
 
     def _update_measured_lcds_from_tm(self, kv: dict[str, str]) -> None:
-        """Refresh X/Y/Z measured LCDs from TM:: key=value (realtime for all axes)."""
+        """Refresh X/Y/Z coil-current LCDs from TM (DROK-measured mA via Pico, realtime)."""
         meas_ok = self._tm_int(kv, "meas_ok")
         if meas_ok is None:
             meas_ok = 1  # legacy TM lines without meas_ok
@@ -2206,6 +2108,8 @@ class CalibratorController:
         for ax, lcd in self._axis_volts_lcd:
             v = self._tm_float(kv, f"coil_V_{ax}")
             if v is None:
+                v = self._tm_float(kv, "measured_vdc")
+            if v is None:
                 self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_volts_cache)
                 continue
             if not trust_meas:
@@ -2223,7 +2127,7 @@ class CalibratorController:
             )
 
     def _update_gauss_lcds_from_tm(self, kv: dict[str, str]) -> None:
-        """|B| (Gauss) at Helmholtz midpoint; current from V/R (ini) or TM mA — every TM:: (real-time)."""
+        """|B| (Gauss) at Helmholtz midpoint; axis I from TM mA only (DROK via Pico) — each TM::."""
         if not self._axis_gauss_lcd:
             return
         meas_ok = self._tm_int(kv, "meas_ok")
@@ -2336,6 +2240,33 @@ class CalibratorController:
             spread <= _NULL_INDICATOR_B_UNIFORM_FRAC + 1e-15
         )
 
+    def _update_cc_coil_leds_from_tm(self, kv: dict[str, str]) -> None:
+        """DROK TM:: ``drok_cc_led`` (0 red / 1 lime CC / 2 yellow) for ``drok_axis`` (or all axes if unknown)."""
+        if not self._led_cc_coil:
+            return
+        led = self._tm_int(kv, "drok_cc_led")
+        if led is None:
+            return
+        axn = (kv.get("drok_axis") or kv.get("DROK_AXIS") or "").strip().upper()[:1]
+        if axn in ("X", "Y", "Z"):
+            axes = (axn,)
+        else:
+            axes = ("X", "Y", "Z")
+        if led == 1:
+            color = "lime"
+        elif led == 2:
+            color = "yellow"
+        else:
+            color = "red"
+        for ax in axes:
+            rb = self._led_cc_coil.get(ax)
+            if rb is not None:
+                _apply_led_color(rb, color)
+
+    def _reset_cc_coil_leds_disconnected(self) -> None:
+        for rb in self._led_cc_coil.values():
+            _apply_led_color(rb, "red")
+
     def _reset_measured_lcds_no_data(self) -> None:
         nodata_style = (
             f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
@@ -2344,7 +2275,6 @@ class CalibratorController:
             self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_meas_cache)
         for _ax, lcd in self._axis_volts_lcd:
             self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_volts_cache)
-        self._reset_test_volt_lcds_no_data()
         self._reset_gauss_lcds_no_data()
         if self._null_frame is not None:
             self._null_indicator_active = None
@@ -2359,662 +2289,18 @@ class CalibratorController:
         for _ax, lcd in self._axis_gauss_lcd:
             self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_gauss_cache)
 
-    def _reset_test_volt_lcds_no_data(self) -> None:
-        if not self._volt_override_lcds:
-            return
-        nodata_style = (
-            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-        )
-        for _ax, lcd in self._volt_override_lcds.items():
-            self._lcd_set_if_changed(
-                lcd, "---", nodata_style, self._lcd_test_volts_cache
-            )
-
-    def _on_volt_override_chk_changed(self, _state: int) -> None:
-        if self._volt_override_chk is None:
-            return
-        if not self._volt_override_chk.isChecked():
-            self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-            if self._serial is not None:
-                try:
-                    blob = b"".join(
-                        f"set_{ax.lower()}_v 0.000\r\n".encode("ascii", errors="replace")
-                        for ax in ("X", "Y", "Z")
-                    )
-                    self._serial.write(blob)
-                    self._serial.flush()
-                except Exception as e:
-                    self._set_status(f"Voltage override off (set_*_v 0): {e}")
-                    return
-            self._set_status("Voltage override off — sent set_x_v/set_y_v/set_z_v 0.")
-        else:
-            self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-            self._set_status(
-                "Voltage override on — enable each axis; host sends set_*_v toward Test V spinboxes."
-            )
-
-    def _on_set_coil_voltages_clicked(self) -> None:
-        """Apply doubleSpinBox_Test_X/Y/Z_V to Pico (set_x_v / set_y_v / set_z_v). Override must be on."""
-        if self._serial is None:
-            self._set_status("Not connected.")
-            return
-        if (
-            self._volt_override_chk is None
-            or len(self._volt_override_spins) != 3
-        ):
-            self._set_status("Voltage override UI is incomplete — Set coil voltages unavailable.")
-            return
-        if not self._volt_override_chk.isChecked():
-            self._set_status(
-                "Turn on voltage override first — then Set applies Test V spinboxes."
-            )
-            return
-        try:
-            for ax in ("X", "Y", "Z"):
-                row = next((r for r in self._axis_rows if r[0] == ax), None)
-                spin = self._volt_override_spins.get(ax)
-                if spin is None or row is None:
-                    continue
-                tgt = max(0.0, float(spin.value()))
-                en = self._coils_axis_enabled(ax)
-                if not en:
-                    self._volt_ov_cmd_v[ax] = 0.0
-                    self._send_axis_set_v(ax, 0.0)
-                    continue
-                self._volt_ov_cmd_v[ax] = tgt
-                self._send_axis_set_v(ax, tgt)
-            self._set_status(
-                "Set coil voltages: sent set_x_v / set_y_v / set_z_v from Test V spinboxes."
-            )
-        except Exception as e:
-            self._set_status(f"Set coil voltages failed: {e}")
-
-    def _send_axis_set_v(self, axis: str, volts: float) -> None:
-        if self._serial is None:
-            return
-        axl = axis.lower()
-        v = max(0.0, min(45.0, float(volts)))
-        line = f"set_{axl}_v {v:.3f}\r\n"
-        try:
-            self._serial.write(line.encode("ascii", errors="replace"))
-            self._serial.flush()
-        except Exception as e:
-            self._set_status(f"{axis} set_*_v write failed: {e}")
-
-    def _on_test_null_changed(self, _state: int = 0) -> None:
-        if self._testcal_chk is None:
-            return
-        if self._testcal_chk.isChecked():
-            self._testcal_start()
-        else:
-            self._testcal_stop(send_safe=True)
-
-    def _testcal_apply_cmds(self, vx: float, vy: float, vz: float) -> None:
-        self._volt_ov_cmd_v = {"X": float(vx), "Y": float(vy), "Z": float(vz)}
-        for ax, v in (("X", vx), ("Y", vy), ("Z", vz)):
-            self._send_axis_set_v(ax, float(v))
-            sp = self._volt_override_spins.get(ax)
-            if sp is not None:
-                sp.blockSignals(True)
-                sp.setValue(float(v))
-                sp.blockSignals(False)
-
-    def _testcal_append_row(
-        self,
-        step_id: str,
-        cmd_vx: float,
-        cmd_vy: float,
-        cmd_vz: float,
-        mag: object,
-        gx: float,
-        gy: float,
-        gz: float,
-        w901_g: tuple[float, float, float] | None = None,
-        w901_g_raw: tuple[float, float, float] | None = None,
-    ) -> None:
-        ws = self._ambian_ws
-        wb = self._ambian_wb
-        if ws is None or wb is None:
-            return
-        kv = self._last_tm_kv if self._last_tm_kv else {}
-
-        def _fin(v: float | None) -> float | None:
-            if v is None or not math.isfinite(v):
-                return None
-            return float(v)
-
-        def _fin_g(v: float) -> float | None:
-            if not math.isfinite(v):
-                return None
-            return float(v)
-
-        def _fin_g3(
-            g: tuple[float, float, float] | None,
-        ) -> tuple[float | None, float | None, float | None]:
-            if g is None:
-                return (None, None, None)
-            a, b, c = g
-            return (_fin_g(float(a)), _fin_g(float(b)), _fin_g(float(c)))
-
-        w9x, w9y, w9z = _fin_g3(w901_g)
-        wrx, wry, wrz = _fin_g3(w901_g_raw)
-
-        def _tmf(k: str) -> float | None:
-            return _fin(CalibratorController._tm_float(kv, k))
-
-        def _tmi(k: str) -> int | None:
-            v = self._tm_int(kv, k)
-            return v if v is not None else None
-
-        b_mag = None
-        if all(math.isfinite(v) for v in (gx, gy, gz)):
-            b_mag = math.sqrt(float(gx) * float(gx) + float(gy) * float(gy) + float(gz) * float(gz))
-        mk = _tmi("meas_ok")
-        try:
-            ws.append(
-                [
-                    datetime.datetime.now(),
-                    step_id,
-                    float(cmd_vx),
-                    float(cmd_vy),
-                    float(cmd_vz),
-                    _fin_g(gx),
-                    _fin_g(gy),
-                    _fin_g(gz),
-                    _fin(b_mag),
-                    _tmf("coil_V_X"),
-                    _tmf("coil_V_Y"),
-                    _tmf("coil_V_Z"),
-                    _tmf("X_ma"),
-                    _tmf("Y_ma"),
-                    _tmf("Z_ma"),
-                    mk,
-                    int(getattr(mag, "x")),
-                    int(getattr(mag, "y")),
-                    int(getattr(mag, "z")),
-                    w9x,
-                    w9y,
-                    w9z,
-                    wrx,
-                    wry,
-                    wrz,
-                ]
-            )
-            wb.save(str(_AMBIAN_XLSX_PATH))
-        except Exception as e:
-            try:
-                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx append failed: %s\n" % (e,))
-            except Exception:
-                pass
-            self._close_ambian_xlsx()
-
-    def _close_ambian_xlsx(self) -> None:
-        wb = self._ambian_wb
-        if wb is None:
-            return
-        try:
-            wb.save(str(_AMBIAN_XLSX_PATH))
-        except Exception as e:
-            try:
-                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx save failed: %s\n" % (e,))
-            except Exception:
-                pass
-        self._ambian_wb = None
-        self._ambian_ws = None
-
-    def _ensure_ambian_xlsx_workbook(self, bump_vx: float, bump_vy: float, bump_vz: float) -> bool:
-        if _OpenpyxlWorkbook is None:
-            if not self._ambian_missing_logged:
-                self._ambian_missing_logged = True
-                try:
-                    sys.stderr.write(
-                        "[CalibratorUI] pip install openpyxl to write %s\n"
-                        % (_AMBIAN_XLSX_PATH.resolve(),)
-                    )
-                except Exception:
-                    pass
-            return False
-        self._close_ambian_xlsx()
-        try:
-            wb = _OpenpyxlWorkbook()
-            ws = wb.active
-            ws.title = "Steps"
-            ws.append(
-                [
-                    "timestamp",
-                    "step_id",
-                    "cmd_Vx",
-                    "cmd_Vy",
-                    "cmd_Vz",
-                    "Gx",
-                    "Gy",
-                    "Gz",
-                    "B_mag",
-                    "coil_V_X",
-                    "coil_V_Y",
-                    "coil_V_Z",
-                    "X_ma",
-                    "Y_ma",
-                    "Z_ma",
-                    "meas_ok",
-                    "RAW_X",
-                    "RAW_Y",
-                    "RAW_Z",
-                    "W901_Gauss_X",
-                    "W901_Gauss_Y",
-                    "W901_Gauss_Z",
-                    "W901_Raw_Gauss_X",
-                    "W901_Raw_Gauss_Y",
-                    "W901_Raw_Gauss_Z",
-                ]
-            )
-            wcfg = wb.create_sheet("Config")
-            wcfg.append(["key", "value"])
-            wcfg.append(["settle_ms", str(_TESTCAL_SETTLE_MS)])
-            wcfg.append(["bump_spin_Vx", str(bump_vx)])
-            wcfg.append(["bump_spin_Vy", str(bump_vy)])
-            wcfg.append(["bump_spin_Vz", str(bump_vz)])
-            wcfg.append(["mag_raw_to_gauss", str(self._mag_raw_to_gauss)])
-            wcfg.append(
-                [
-                    "wit901_port",
-                    self._ini.get("serial", "wit901_port", fallback=_DEFAULT_WIT901_PORT).strip(),
-                ]
-            )
-            wcfg.append(
-                [
-                    "wit901_baud",
-                    self._ini.get("serial", "wit901_baud", fallback=str(_DEFAULT_WIT901_BAUD)).strip(),
-                ]
-            )
-            wcfg.append(
-                [
-                    "wit901_gauss",
-                    "wit901_mag_stream lsbs_to_gauss: int16*(16/32768)µT/LSB, G=µT/100",
-                ]
-            )
-            wcfg.append(["CALIBRATOR_UI_VERSION", CALIBRATOR_UI_VERSION])
-            wcfg.append(
-                [
-                    "mt102_swapped_xy_effective",
-                    str(_serial_mt102_swapped_xy(self._ini)),
-                ]
-            )
-            wcfg.append(
-                [
-                    "W901_columns",
-                    "W901_Gauss_* = after mt102_swapped_xy; W901_Raw_Gauss_* = Wit UART frame (no swap)",
-                ]
-            )
-            self._ambian_wb = wb
-            self._ambian_ws = ws
-            wb.save(str(_AMBIAN_XLSX_PATH))
-        except Exception as e:
-            self._ambian_wb = None
-            self._ambian_ws = None
-            try:
-                sys.stderr.write("[CalibratorUI] AmbianReadings.xlsx init failed: %s\n" % (e,))
-            except Exception:
-                pass
-            return False
-        return True
-
-    def _testcal_start(self) -> None:
-        """Open-loop four-step ambient / axis-bump capture → AmbianReadings.xlsx."""
-        if self._testcal_chk is None:
-            return
-        if self._serial is None:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: connect Pico serial first.")
-            return
-        if MT102Interface is None or self._mt102 is None:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: connect MT-102 (Connect all) first.")
-            return
-        try:
-            if not self._mt102.is_connected():
-                raise RuntimeError("MT-102 not connected")
-        except Exception:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: MT-102 not connected.")
-            return
-        cal = None
-        try:
-            if hasattr(self._mt102, "get_cal_data"):
-                cal = self._mt102.get_cal_data()
-        except Exception:
-            cal = None
-        if cal is None:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: wait for MT-102 factory F-cal (Gauss) before enabling.")
-            return
-        if len(self._volt_override_spins) != 3:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: need Test V spinboxes (doubleSpinBox_Test_X/Y/Z_V).")
-            return
-        if self._master_coils_enable is None:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: need checkBox_TestVoltageSetting (master coil enable).")
-            return
-
-        spx = self._volt_override_spins.get("X")
-        spy = self._volt_override_spins.get("Y")
-        spz = self._volt_override_spins.get("Z")
-        if spx is None or spy is None or spz is None:
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: need Test V spinboxes.")
-            return
-        self._testcal_vx = max(0.0, float(spx.value()))
-        self._testcal_vy = max(0.0, float(spy.value()))
-        self._testcal_vz = max(0.0, float(spz.value()))
-
-        if not self._ensure_ambian_xlsx_workbook(self._testcal_vx, self._testcal_vy, self._testcal_vz):
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-            self._set_status("Test NULL: openpyxl missing or AmbianReadings.xlsx could not be created.")
-            return
-
-        self._testcal_prev_override_checked = bool(
-            self._volt_override_chk is not None and self._volt_override_chk.isChecked()
-        )
-        if self._volt_override_chk is not None:
-            self._volt_override_chk.blockSignals(True)
-            self._volt_override_chk.setChecked(True)
-            self._volt_override_chk.blockSignals(False)
-            self._volt_override_chk.setEnabled(False)
-
-        self._master_coils_enable.blockSignals(True)
-        self._master_coils_enable.setChecked(True)
-        self._master_coils_enable.blockSignals(False)
-        self._master_coils_enable.setEnabled(False)
-        self._on_master_coils_enable_changed(0)
-
-        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
-            if chk is not None:
-                chk.setEnabled(False)
-        for sp in self._volt_override_spins.values():
-            sp.setEnabled(False)
-
-        self._testcal_active = True
-        self._testcal_after_apply_index = 0
-        self._testcal_apply_cmds(0.0, 0.0, 0.0)
-        self._set_status(
-            "Test NULL: ambient 4-step run (settle %d ms per step) → %s"
-            % (_TESTCAL_SETTLE_MS, _AMBIAN_XLSX_PATH.name)
-        )
-        self._dbg(1, "Test NULL: ambient capture started", _AMBIAN_XLSX_PATH.resolve())
-        self._testcal_timer.start(_TESTCAL_SETTLE_MS)
-
-    def _testcal_on_settle(self) -> None:
-        if not self._testcal_active:
-            return
-        if self._serial is None or MT102Interface is None or self._mt102 is None:
-            self._testcal_stop(send_safe=False)
-            return
-        cal = None
-        try:
-            if hasattr(self._mt102, "get_cal_data"):
-                cal = self._mt102.get_cal_data()
-        except Exception:
-            cal = None
-        if cal is None:
-            self._testcal_stop(send_safe=True)
-            return
-        try:
-            mag = self._mt102.get_mag_data(timeout=0.1)
-        except Exception:
-            mag = None
-        if mag is None:
-            self._testcal_stop(send_safe=True)
-            self._set_status("Test NULL: lost MT-102 sample during run.")
-            return
-        try:
-            gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
-        except Exception:
-            self._testcal_stop(send_safe=True)
-            return
-        if not all(math.isfinite(v) for v in (gx, gy, gz)):
-            self._testcal_stop(send_safe=True)
-            return
-
-        w901_raw, w901_g = self._snapshot_wit901_gauss_raw_and_display()
-
-        idx = self._testcal_after_apply_index
-        if idx == 0:
-            name, vx, vy, vz = "all_zero", 0.0, 0.0, 0.0
-        elif idx == 1:
-            name, vx, vy, vz = "Vx_only", self._testcal_vx, 0.0, 0.0
-        elif idx == 2:
-            name, vx, vy, vz = "Vy_only", 0.0, self._testcal_vy, 0.0
-        else:
-            name, vx, vy, vz = "Vz_only", 0.0, 0.0, self._testcal_vz
-        self._testcal_append_row(
-            name, vx, vy, vz, mag, gx, gy, gz, w901_g=w901_g, w901_g_raw=w901_raw
-        )
-
-        if idx >= 3:
-            self._testcal_finish(send_safe=True)
-            return
-
-        if idx == 0:
-            self._testcal_apply_cmds(self._testcal_vx, 0.0, 0.0)
-            self._testcal_after_apply_index = 1
-        elif idx == 1:
-            self._testcal_apply_cmds(0.0, self._testcal_vy, 0.0)
-            self._testcal_after_apply_index = 2
-        else:
-            self._testcal_apply_cmds(0.0, 0.0, self._testcal_vz)
-            self._testcal_after_apply_index = 3
-        self._testcal_timer.start(_TESTCAL_SETTLE_MS)
-
-    def _sync_master_coils_ui_off_after_testcal_safe(self) -> None:
-        """After Test NULL sends SAFE, Pico coils are off; match the master checkbox so the UI is not 'on' while idle."""
-        if self._master_coils_enable is None or self._serial is None:
-            return
-        self._master_coils_enable.blockSignals(True)
-        self._master_coils_enable.setChecked(False)
-        self._master_coils_enable.blockSignals(False)
-        self._on_master_coils_enable_changed(0)
-
-    def _testcal_finish(self, send_safe: bool = True) -> None:
-        self._testcal_timer.stop()
-        was = self._testcal_active
-        self._testcal_active = False
-        self._testcal_apply_cmds(0.0, 0.0, 0.0)
-        self._close_ambian_xlsx()
-        if self._volt_override_spins:
-            for sp in self._volt_override_spins.values():
-                sp.setEnabled(True)
-        if self._volt_override_chk is not None:
-            self._volt_override_chk.setEnabled(True)
-            self._volt_override_chk.blockSignals(True)
-            self._volt_override_chk.setChecked(self._testcal_prev_override_checked)
-            self._volt_override_chk.blockSignals(False)
-        if self._master_coils_enable is not None:
-            self._master_coils_enable.setEnabled(True)
-        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
-            if chk is not None:
-                chk.setEnabled(True)
-        if self._testcal_chk is not None and self._testcal_chk.isChecked():
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-        if send_safe and was and self._serial is not None:
-            try:
-                self._dbg(1, "Test NULL: ambient capture done → SAFE")
-                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-                self._serial.write(b"safe\r\n")
-                self._serial.flush()
-                self._sync_master_coils_ui_off_after_testcal_safe()
-                self._set_status("Test NULL: done — %s saved; SAFE sent." % _AMBIAN_XLSX_PATH.name)
-            except Exception as e:
-                self._set_status("Test NULL: SAFE failed: %s" % (e,))
-        elif was:
-            self._set_status("Test NULL: done — %s saved." % _AMBIAN_XLSX_PATH.name)
-
-    def _testcal_stop(self, send_safe: bool = True) -> None:
-        """User unchecked Test NULL or abort: stop timer, optional SAFE."""
-        self._testcal_timer.stop()
-        was = self._testcal_active
-        self._testcal_active = False
-        self._testcal_apply_cmds(0.0, 0.0, 0.0)
-        self._close_ambian_xlsx()
-        if self._volt_override_spins:
-            for sp in self._volt_override_spins.values():
-                sp.setEnabled(True)
-        if self._volt_override_chk is not None:
-            self._volt_override_chk.setEnabled(True)
-            self._volt_override_chk.blockSignals(True)
-            self._volt_override_chk.setChecked(self._testcal_prev_override_checked)
-            self._volt_override_chk.blockSignals(False)
-        if self._master_coils_enable is not None:
-            self._master_coils_enable.setEnabled(True)
-        for _ax, _sp, _pb, _lcd, chk in self._axis_rows:
-            if chk is not None:
-                chk.setEnabled(True)
-        if self._testcal_chk is not None and self._testcal_chk.isChecked():
-            self._testcal_chk.blockSignals(True)
-            self._testcal_chk.setChecked(False)
-            self._testcal_chk.blockSignals(False)
-        if send_safe and was and self._serial is not None:
-            try:
-                self._dbg(1, "Test NULL: abort → SAFE")
-                if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                    self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-                self._serial.write(b"safe\r\n")
-                self._serial.flush()
-                self._sync_master_coils_ui_off_after_testcal_safe()
-                self._set_status("Test NULL off — SAFE sent (coils off).")
-            except Exception as e:
-                self._set_status("Test NULL stop: SAFE failed: %s" % (e,))
-        elif was:
-            self._set_status("Test NULL off.")
-
-    def _volt_override_pwm_adjust(self, kv: dict[str, str]) -> None:
-        """Nudge set_<axis>_v using TM:: coil_V_* vs doubleSpinBox_Test_*_V (Pico 5.x voltage mode)."""
-        if self._testcal_active:
-            return
-        if self._volt_override_chk is None or not self._volt_override_chk.isChecked():
-            return
-        if self._serial is None:
-            return
-        mk = self._tm_int(kv, "meas_ok")
-        trust_meas = (mk != 0) if mk is not None else True
-        v_cmd_cap = 20.0 if trust_meas else min(20.0, _VOLT_OVERRIDE_MAX_CMD_V_IF_MEAS_BAD)
-        for ax in ("X", "Y", "Z"):
-            row = next((r for r in self._axis_rows if r[0] == ax), None)
-            if row is None or not self._coils_axis_enabled(ax):
-                continue
-            vbus = self._tm_float(kv, f"coil_V_{ax}")
-            spin = self._volt_override_spins.get(ax)
-            if spin is None:
-                continue
-            target = float(spin.value())
-            tol = _TEST_VOLT_TOL_V
-            if target <= 1e-6:
-                if self._volt_ov_cmd_v[ax] > 1e-6:
-                    self._volt_ov_cmd_v[ax] = 0.0
-                    self._send_axis_set_v(ax, 0.0)
-                continue
-            v_eff = 0.0 if vbus is None else float(vbus)
-            err = target - v_eff
-            cmd = float(self._volt_ov_cmd_v[ax])
-            if abs(err) <= tol:
-                continue
-            step_v = max(0.05, min(0.5, abs(err) * 0.15))
-            if err > tol:
-                cmd = min(min(target, v_cmd_cap), cmd + step_v)
-            else:
-                cmd = max(0.0, cmd - step_v)
-            cmd = max(0.0, min(v_cmd_cap, cmd))
-            if abs(cmd - float(self._volt_ov_cmd_v[ax])) > 1e-4:
-                self._volt_ov_cmd_v[ax] = cmd
-                self._send_axis_set_v(ax, cmd)
-
-    def _update_test_volt_lcds_from_tm(self, kv: dict[str, str]) -> None:
-        if not self._volt_override_lcds:
-            return
-        meas_ok = self._tm_int(kv, "meas_ok")
-        trust_meas = meas_ok != 0 if meas_ok is not None else True
-        nodata_style = (
-            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
-        )
-        neutral_style = (
-            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NEUTRAL};"
-        )
-        ov = (
-            self._volt_override_chk is not None
-            and self._volt_override_chk.isChecked()
-        )
-        for ax in ("X", "Y", "Z"):
-            lcd = self._volt_override_lcds.get(ax)
-            if lcd is None:
-                continue
-            v = self._tm_float(kv, f"coil_V_{ax}")
-            en = self._coils_axis_enabled(ax)
-            spin = self._volt_override_spins.get(ax)
-            target = float(spin.value()) if spin is not None else 0.0
-
-            if v is None:
-                self._lcd_set_if_changed(
-                    lcd, "---", nodata_style, self._lcd_test_volts_cache
-                )
-                continue
-            if not ov:
-                self._lcd_set_if_changed(
-                    lcd, f"{v:.2f}", neutral_style, self._lcd_test_volts_cache
-                )
-                continue
-            if not trust_meas:
-                self._lcd_set_if_changed(
-                    lcd, f"{v:.2f}", neutral_style, self._lcd_test_volts_cache
-                )
-                continue
-            if not en:
-                self._lcd_set_if_changed(
-                    lcd, f"{v:.2f}", neutral_style, self._lcd_test_volts_cache
-                )
-                continue
-            c = _test_volt_lcd_digit_color(v, target)
-            self._lcd_set_if_changed(
-                lcd,
-                f"{v:.2f}",
-                f"background-color: {_MEAS_LCD_BG}; color: {c};",
-                self._lcd_test_volts_cache,
-            )
-
     def _on_safe_calibrator(self) -> None:
-        """Send `safe`: Pico coils off, zero setpoints, disables — not latched (Pico ≥3.37)."""
+        """Send `safe`: temporary drive-off / disable for the connected axis (firmware); COM may stay open."""
         if self._serial is None:
             self._set_status("Not connected.")
             return
-        if self._testcal_active or (
-            self._testcal_chk is not None and self._testcal_chk.isChecked()
-        ):
-            self._testcal_stop(send_safe=False)
         try:
             self._dbg(1, "action: SAFE (safe)")
-            if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
             self._serial.write(b"safe\r\n")
             self._serial.flush()
-            self._set_status("SAFE sent (coils off; re-enable / Set to run again).")
+            self._set_status(
+                "SAFE sent (temporary disable — output off). Disconnect and reconnect serial to re-arm enables."
+            )
         except Exception as e:
             self._set_status(f"SAFE write failed: {e}")
 
@@ -3025,8 +2311,6 @@ class CalibratorController:
             return
         try:
             self._dbg(1, "action: Reset (safe_reset)")
-            if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
             self._serial.write(b"safe_reset\r\n")
             self._serial.flush()
             self._set_status("safe_reset sent (Pico PWM/coils off).")
@@ -3034,40 +2318,6 @@ class CalibratorController:
             self._update_status_leds()
         except Exception as e:
             self._set_status(f"Reset write failed: {e}")
-
-    def _on_set_axis_ma(self, axis: str) -> None:
-        """Send set_<axis>_v from doubleSpinBox_Test_<axis>_V (Pico 5.x); axis must be Enabled."""
-        if self._serial is None:
-            self._set_status("Not connected.")
-            return
-        row = next((r for r in self._axis_rows if r[0] == axis), None)
-        if row is None:
-            return
-        _ax, _spin_ma, _pb, _lcd, _chk = row
-        if not self._coils_axis_enabled(axis):
-            self._set_status(
-                "Coils are not enabled — turn on the coil enable checkbox before Set."
-            )
-            return
-        vspin = self._volt_override_spins.get(axis)
-        if vspin is None:
-            self._set_status(
-                f"Set {axis}: need doubleSpinBox_Test_{axis}_V (full voltage-override widget set in .ui)."
-            )
-            return
-        val = max(0.0, float(vspin.value()))
-        axl = axis.lower()
-        line = f"set_{axl}_v {val:.3f}\r\n"
-        try:
-            self._dbg(1, "action: Set", axis, f"{val:.3f} V", "from", vspin.objectName())
-            self._dbg(2, "Set TX", line.strip())
-            self._serial.write(line.encode("ascii", errors="replace"))
-            self._serial.flush()
-            if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-                self._volt_ov_cmd_v[axis] = val
-            self._set_status(f"Set {axis}: {val:.3f} V (set_{axl}_v)")
-        except Exception as e:
-            self._set_status(f"Serial write failed: {e}")
 
     def _apply_tm_line(self, line: str) -> None:
         """Telemetry line: updates status LEDs; not copied to the text log."""
@@ -3106,10 +2356,9 @@ class CalibratorController:
             self._meas_ok = mk != 0
         self._update_status_leds()
         self._update_measured_lcds_from_tm(kv)
-        self._update_test_volt_lcds_from_tm(kv)
-        self._volt_override_pwm_adjust(kv)
         self._update_gauss_lcds_from_tm(kv)
         self._update_null_indicator_from_tm(kv)
+        self._update_cc_coil_leds_from_tm(kv)
         self._note_pico_liveness()
         self._append_tm_csv_row(kv)
         self._last_tm_kv = dict(kv)
@@ -3325,46 +2574,8 @@ class CalibratorController:
                 self._dbg(1, "link: recovered (Pico traffic seen)")
 
     def _update_status_leds(self) -> None:
-        """Connected: red/yellow/green. Configured / closed loop: wired when protocol exists."""
-        if self._serial is None:
-            _apply_led_color(self._led_connected, "red")
-            self._pico_has_error = False
-        elif self._pico_has_error or self._pico_alive_stale:
-            _apply_led_color(self._led_connected, "yellow")
-        else:
-            _apply_led_color(self._led_connected, "green")
-
-        if self._configured_ok:
-            _apply_led_color(self._led_configured, "green")
-        else:
-            _apply_led_color(self._led_configured, "gray")
-
-        if self._closed_loop_ok:
-            _apply_led_color(self._led_closed_loop, "green")
-        else:
-            _apply_led_color(self._led_closed_loop, "gray")
-
-        # Initialized: INA / sense path ready (meas_ok from Pico TM).
-        if self._serial is None:
-            _apply_led_color(self._led_initialized, "gray")
-        elif self._meas_ok is True:
-            _apply_led_color(self._led_initialized, "green")
-        elif self._meas_ok is False:
-            _apply_led_color(self._led_initialized, "yellow")
-        else:
-            _apply_led_color(self._led_initialized, "yellow")
-
-        # DC State: green in closed-loop; red on fault or fall-out of closed-loop; gray otherwise.
-        if self._serial is None:
-            _apply_led_color(self._led_dc_state, "gray")
-        elif self._pico_has_error:
-            _apply_led_color(self._led_dc_state, "red")
-        elif self._closed_loop_ok:
-            _apply_led_color(self._led_dc_state, "green")
-        elif self._cl_before_tm and not self._closed_loop_ok:
-            _apply_led_color(self._led_dc_state, "red")
-        else:
-            _apply_led_color(self._led_dc_state, "gray")
+        """CalibratorUI_DROK.ui has no legacy Pico status radio LEDs; keep hook for callers."""
+        return
 
     def set_pico_error(self, has_error: bool) -> None:
         """Call when host detects Pico fault (e.g. serial line / future status). Yellow if True."""
@@ -3700,6 +2911,104 @@ class CalibratorController:
                     % (MT102_LCD_BG, color)
                 )
 
+    def _reset_gauss_source_combo_for_disconnect(self) -> None:
+        """Clear Gauss source selector (DROK UI) when sensors disconnect."""
+        self._gauss_combo_seeded = False
+        c = getattr(self, "_combo_gauss_source", None)
+        if c is None:
+            return
+        c.blockSignals(True)
+        c.clear()
+        c.blockSignals(False)
+        c.setEnabled(False)
+
+    def _populate_gauss_source_combo(self) -> None:
+        """Fill ``comboBox_SelectedGaussSource`` after MT-102 and/or Wit901 are live (DROK UI)."""
+        c = getattr(self, "_combo_gauss_source", None)
+        if c is None:
+            return
+        mt_ok = False
+        m = getattr(self, "_mt102", None)
+        if m is not None:
+            try:
+                mt_ok = bool(m.is_connected())
+            except Exception:
+                mt_ok = False
+        w9_ok = bool(getattr(self, "_wit901_uart_open", False))
+        if not mt_ok and not w9_ok:
+            self._reset_gauss_source_combo_for_disconnect()
+            return
+        prev = c.currentText().strip() if c.count() else ""
+        c.blockSignals(True)
+        c.clear()
+        if mt_ok:
+            c.addItem("MT102")
+        if w9_ok:
+            c.addItem("WIT901")
+        c.blockSignals(False)
+        c.setEnabled(c.count() > 0)
+        self._gauss_combo_seeded = True
+        if prev:
+            idx = c.findText(prev)
+            if idx >= 0:
+                c.setCurrentIndex(idx)
+        elif c.count() > 0:
+            c.setCurrentIndex(0)
+
+    def _refresh_drok_axis_gauss_lcds(
+        self,
+        have_mt102_field_gauss: bool,
+        gx: float,
+        gy: float,
+        gz: float,
+    ) -> None:
+        """Drive ``lcdNumber_*_Axis_Gauss`` from MT102 or Wit901 × per-axis cal spin (DROK UI)."""
+        if not self._drok_axis_gauss_lcds:
+            return
+        combo = self._combo_gauss_source
+        if combo is None or combo.count() == 0:
+            label = "MT102"
+        else:
+            label = (combo.currentText() or "MT102").strip().upper()
+        use_mt = "MT" in label or "102" in label
+        w901_t = self._snapshot_wit901_gauss()
+        nodata_style = (
+            f"background-color: {_MEAS_LCD_BG}; color: {_MEAS_LCD_NO_DATA};"
+        )
+        vals: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
+        if use_mt:
+            if have_mt102_field_gauss and all(
+                math.isfinite(v) for v in (gx, gy, gz)
+            ):
+                vals = {"X": float(gx), "Y": float(gy), "Z": float(gz)}
+        else:
+            if w901_t is not None and len(w901_t) == 3:
+                x, y, z = float(w901_t[0]), float(w901_t[1]), float(w901_t[2])
+                if all(math.isfinite(v) for v in (x, y, z)):
+                    vals = {"X": x, "Y": y, "Z": z}
+        for ax, lcd in self._drok_axis_gauss_lcds:
+            cal = self._gauss_cal_spins.get(ax)
+            try:
+                factor = float(cal.value()) if cal is not None else 1.0
+            except Exception:
+                factor = 1.0
+            if factor != factor or abs(factor) > 1e9:
+                factor = 1.0
+            raw = vals.get(ax)
+            if raw is None or raw != raw:
+                self._lcd_set_if_changed(lcd, "---", nodata_style, self._lcd_gauss_cache)
+                continue
+            out = float(raw) * factor
+            c = self._mag_lcd_color_gauss(
+                out, self._mt102_gauss_green, self._mt102_gauss_amber
+            )
+            self._lcd_set_if_changed(
+                lcd,
+                "%.3f" % out,
+                f"background-color: {_MEAS_LCD_BG}; color: {c};",
+                self._lcd_gauss_cache,
+            )
+
     def _snapshot_wit901_gauss_raw(self) -> tuple[float, float, float] | None:
         """Wit901 Gauss (X,Y,Z) from ``wit901_mag_stream`` with **no** ``mt102_swapped_xy`` remap."""
         w = getattr(self, "_wit901", None)
@@ -3780,6 +3089,7 @@ class CalibratorController:
         return _MEAS_LCD_RED
 
     def _disconnect_wit901_only(self) -> None:
+        self._wit901_uart_open = False
         w = getattr(self, "_wit901", None)
         if w is not None:
             try:
@@ -3791,6 +3101,7 @@ class CalibratorController:
         except Exception:
             pass
         self._wit901_field_gauss_lcds = None
+        self._populate_gauss_source_combo()
 
     def _disconnect_mt102_only(self) -> None:
         if getattr(self, "_mt102", None) is not None:
@@ -3806,8 +3117,8 @@ class CalibratorController:
             self._mt102_fcal_missing_logged = False
             self._close_mag_test_xlsx()
             self._close_external_drive_xlsx()
-            self._close_ambian_xlsx()
             self._refresh_mt102_fcal_applied_led()
+            self._populate_gauss_source_combo()
         vd = getattr(self, "_viewer3d", None)
         if vd is not None and hasattr(vd, "set_rotation"):
             try:
@@ -3921,6 +3232,8 @@ class CalibratorController:
             )
             return
         self._dbg(3, "Wit901: opened", port, "@", baud)
+        self._wit901_uart_open = True
+        self._populate_gauss_source_combo()
         self._set_status("%s | Wit901 %s @ %d" % (self._status_main.text(), port, baud))
         try:
             sys.stderr.write(
@@ -4272,21 +3585,32 @@ class CalibratorController:
 
     def _mag_poll(self) -> None:
         """Poll MT-102 for M packets; update data monitor, optional LCDs, 3D viewer."""
+        gx = gy = gz = float("nan")
+        have_g = False
+
+        def _finish_axis_gauss() -> None:
+            self._last_mt102_field_gauss = (gx, gy, gz, have_g)
+            self._refresh_drok_axis_gauss_lcds(have_g, gx, gy, gz)
+
         self._refresh_wit901_gauss_lcds(self._snapshot_wit901_gauss())
         if not getattr(self, "_mt102", None) or self._mt102 is None:
+            _finish_axis_gauss()
             return
         try:
             if not self._mt102.is_connected():
                 self._disconnect_mt102_only()
                 self._set_status("MT-102 connection lost — check cable or port")
+                _finish_axis_gauss()
                 return
         except Exception:
+            _finish_axis_gauss()
             return
         self._maybe_request_mt102_fcal()
         self._refresh_mt102_fcal_applied_led()
         try:
             mag = self._mt102.get_mag_data(timeout=0)
         except Exception:
+            _finish_axis_gauss()
             return
         if not self._dbg_mt102_f_cal_logged and hasattr(self._mt102, "get_cal_data"):
             try:
@@ -4342,6 +3666,7 @@ class CalibratorController:
                 if br > 0 and mp == 0:
                     msg += "Last raw (hex): %s\n" % raw_hex
                 te.setPlainText(msg)
+            _finish_axis_gauss()
             return
         cal = None
         try:
@@ -4369,6 +3694,7 @@ class CalibratorController:
                 gx, gy, gz = cal.raw_to_gauss(mag, self._mag_raw_to_gauss)
                 have_g = all(math.isfinite(v) for v in (gx, gy, gz))
             except Exception:
+                _finish_axis_gauss()
                 return
         if (
             self._debug_level == _MT102_TRACE_DEBUG_MIN
@@ -4401,7 +3727,7 @@ class CalibratorController:
                 lcd.setStyleSheet(
                     "background-color: %s; color: %s;" % (MT102_LCD_BG, color)
                 )
-        # Discover once: MOPS.ui mixes Mt102 vs MT102 and Gauss vs gauss; findChild-by-fixed-list can miss Y/Z.
+        # Discover once: UI mixes Mt102 vs MT102 and Gauss vs gauss; findChild-by-fixed-list can miss Y/Z.
         if self._mt102_field_gauss_lcds is None:
             self._mt102_field_gauss_lcds = self._discover_mt102_field_gauss_lcds()
             n = len(self._mt102_field_gauss_lcds)
@@ -4538,6 +3864,7 @@ class CalibratorController:
                     lcd.setDigitCount(7)
                     lcd.setMode(QLCDNumber.Mode.Dec)
                     lcd.display("---")
+        _finish_axis_gauss()
         self._refresh_mt102_fcal_applied_led()
 
     def _install_viewer3d(self) -> None:
@@ -4582,7 +3909,7 @@ class CalibratorController:
         self._update_status_leds()
 
     def _set_pico_path_widgets_enabled(self, enabled: bool) -> None:
-        """External Drive bench mode: disable Pico COM, coils, Test NULL, SAFE/Reset."""
+        """External Drive bench mode: disable Pico COM, coil-related controls, SAFE/Reset."""
         if self._combo_port is not None:
             self._combo_port.setEnabled(enabled)
         if self._combo_baud is not None:
@@ -4593,12 +3920,6 @@ class CalibratorController:
             self._btn_safe.setEnabled(enabled)
         if getattr(self, "_btn_reset", None) is not None:
             self._btn_reset.setEnabled(enabled)
-        if self._master_coils_enable is not None:
-            self._master_coils_enable.setEnabled(enabled)
-        if self._testcal_chk is not None:
-            self._testcal_chk.setEnabled(enabled)
-        if self._btn_set_coil_v is not None:
-            self._btn_set_coil_v.setEnabled(enabled)
         for _ax, sp, pb, _lcd, chk in self._axis_rows:
             if sp is not None:
                 sp.setEnabled(enabled)
@@ -4606,10 +3927,6 @@ class CalibratorController:
                 pb.setEnabled(enabled)
             if chk is not None:
                 chk.setEnabled(enabled)
-        if self._volt_override_chk is not None:
-            self._volt_override_chk.setEnabled(enabled)
-        for _ax, sp in self._volt_override_spins.items():
-            sp.setEnabled(enabled)
 
     def _connect_external_drive_sensors(self) -> None:
         """Open MT-102 then Wit901; no Pico. Caller starts `_serial_timer` for `_mag_poll`."""
@@ -4660,6 +3977,7 @@ class CalibratorController:
                 self._serial_timer.start()
             except Exception:
                 pass
+            self._populate_gauss_source_combo()
             self._status_conn.setText(
                 "Connection: External drive (MT-102 + Wit901, no Pico)"
             )
@@ -4769,9 +4087,8 @@ class CalibratorController:
         self._serial_timer.start()
         if self._text_out is not None:
             self._append_pico_log_line(
-                "[CalibratorUI] This log shows Pico TXT:: only; TM:: updates the coil/current LCDs. "
-                "Check master coil enable + Test V for PWM. If LCDs stay ---, try soft_reset_on_connect=1 "
-                "in CalibratorUI.ini [serial] or power-cycle the Pico / verify COM."
+                "[CalibratorUI] This log shows Pico TXT:: only; TM:: carries DROK-measured coil mA / V to the current and volts LCDs. "
+                "If LCDs stay ---, try soft_reset_on_connect=1 in CalibratorUI.ini [serial] or power-cycle the Pico / verify COM."
             )
         QTimer.singleShot(0, self._connect_rx_pump_slice)
         QTimer.singleShot(100, self._send_axis_enables_to_pico)
@@ -4780,135 +4097,24 @@ class CalibratorController:
             QTimer.singleShot(280, self._request_hw_report_after_connect)
         self._connect_mt102_after_pico()
         self._connect_wit901_if_configured()
+        self._populate_gauss_source_combo()
 
     def _send_axis_enables_to_pico(self) -> None:
-        """After connect: push set_*_v from Test V spinboxes (when present), then enable_X/Y/Z.
-
-        Pico 5.x applies PWM only when an axis is enabled *and* set_*_v > 0. Sending enables alone
-        leaves set_*_v at zero on the Pico; the spin values are the single source for command volts.
-        """
+        """After connect: send enable_x/y/z 1 for all axes (serial connection implies enabled)."""
         if self._serial is None:
             return
         try:
-            pre = b""
-            if len(self._volt_override_spins) == 3:
-                for ax in ("X", "Y", "Z"):
-                    row = next((r for r in self._axis_rows if r[0] == ax), None)
-                    spin = self._volt_override_spins.get(ax)
-                    if spin is None or row is None:
-                        continue
-                    tgt = max(0.0, float(spin.value()))
-                    en = self._coils_axis_enabled(ax)
-                    axl = ax.lower()
-                    if not en:
-                        self._volt_ov_cmd_v[ax] = 0.0
-                        pre += f"set_{axl}_v 0.000\r\n".encode("ascii", errors="replace")
-                    else:
-                        self._volt_ov_cmd_v[ax] = tgt
-                        pre += f"set_{axl}_v {tgt:.3f}\r\n".encode("ascii", errors="replace")
             parts = b"".join(
                 f"enable_{ax.lower()} {1 if self._coils_axis_enabled(ax) else 0}\r\n".encode(
                     "ascii", errors="replace"
                 )
                 for ax in ("X", "Y", "Z")
             )
-            self._serial.write(pre + parts)
+            self._serial.write(parts)
             self._serial.flush()
-            self._dbg(
-                1,
-                "connect: sent",
-                ("set_*_v then " if pre else "") + "enable_x/y/z from GUI",
-            )
+            self._dbg(1, "connect: sent", "enable_x/y/z 1 (connected)")
         except Exception as e:
             self._dbg(1, "connect: enable send failed:", e)
-
-    def _on_master_coils_enable_changed(self, _state: int = 0) -> None:
-        """Single master checkbox: send enable_x/y/z to Pico (not persisted to ini)."""
-        if self._master_coils_enable is None:
-            return
-        on = self._master_coils_enable.isChecked()
-        if self._serial is None:
-            return
-        iv = 1 if on else 0
-        try:
-            blob = b"".join(
-                f"enable_{ax.lower()} {iv}\r\n".encode("ascii", errors="replace")
-                for ax in ("X", "Y", "Z")
-            )
-            self._serial.write(blob)
-            self._serial.flush()
-            self._dbg(1, "master coils enable:", iv)
-        except Exception as e:
-            self._set_status(f"enable write failed: {e}")
-            return
-        if self._volt_override_chk is not None and self._volt_override_chk.isChecked():
-            if not on:
-                self._volt_ov_cmd_v = {"X": 0.0, "Y": 0.0, "Z": 0.0}
-            else:
-                for ax in ("X", "Y", "Z"):
-                    spin = self._volt_override_spins.get(ax)
-                    if spin is None or float(spin.value()) <= 1e-6:
-                        continue
-                    if float(self._volt_ov_cmd_v.get(ax, 0.0)) > 1e-6:
-                        continue
-                    v0 = max(0.0, float(spin.value()))
-                    self._volt_ov_cmd_v[ax] = v0
-                    self._send_axis_set_v(ax, v0)
-                    self._dbg(
-                        1,
-                        "volt override: immediate set_*_v from Test V spin (master enable)",
-                        ax,
-                        v0,
-                        "V",
-                    )
-
-    def _on_axis_enable_changed(self, axis: str) -> None:
-        """Persist checkbox to ini; if connected, notify Pico immediately."""
-        if self._master_coils_enable is not None:
-            return
-        row = next((r for r in self._axis_rows if r[0] == axis), None)
-        if row is None:
-            return
-        chk = row[4]
-        if chk is None:
-            return
-        self._ini.set("settings", f"enable_{axis}", "1" if chk.isChecked() else "0")
-        save_ini(self._ini)
-        if self._serial is None:
-            return
-        val = 1 if chk.isChecked() else 0
-        axl = axis.lower()
-        try:
-            self._serial.write(f"enable_{axl} {val}\r\n".encode("ascii", errors="replace"))
-            self._serial.flush()
-            self._dbg(1, "enable:", axis, val)
-        except Exception as e:
-            self._set_status(f"enable_{axl} write failed: {e}")
-            return
-        if (
-            self._volt_override_chk is not None
-            and self._volt_override_chk.isChecked()
-            and val == 0
-        ):
-            self._volt_ov_cmd_v[axis] = 0.0
-        if (
-            self._volt_override_chk is not None
-            and self._volt_override_chk.isChecked()
-            and val != 0
-        ):
-            spin = self._volt_override_spins.get(axis)
-            if spin is not None and float(spin.value()) > 1e-6:
-                if float(self._volt_ov_cmd_v[axis]) <= 1e-6:
-                    v0 = max(0.0, float(spin.value()))
-                    self._volt_ov_cmd_v[axis] = v0
-                    self._send_axis_set_v(axis, v0)
-                    self._dbg(
-                        1,
-                        "volt override: immediate set_*_v from Test V spin on enable",
-                        axis,
-                        v0,
-                        "V",
-                    )
 
     def _request_hw_report_after_connect(self) -> None:
         """Ask Pico to re-print hw_report so textEdit gets boot-equivalent TXT:: after a late COM open."""
@@ -4923,7 +4129,6 @@ class CalibratorController:
 
     def _disconnect(self) -> None:
         self._dbg(1, "disconnect: stopping timers and closing serial")
-        self._testcal_stop(send_safe=False)
         self._disconnect_wit901_only()
         self._disconnect_mt102_only()
         self._connect_rx_pump_slices = 0
@@ -4955,7 +4160,6 @@ class CalibratorController:
             self._serial = None
         self._lcd_meas_cache.clear()
         self._lcd_volts_cache.clear()
-        self._lcd_test_volts_cache.clear()
         self._lcd_gauss_cache.clear()
         if self._null_frame is not None:
             self._null_indicator_active = None
@@ -4969,6 +4173,8 @@ class CalibratorController:
         self._save_serial_ini()
         self._set_connected_ui(False)
         self._set_status("Disconnected.")
+        self._reset_gauss_source_combo_for_disconnect()
+        self._reset_cc_coil_leds_disconnected()
         self._reset_measured_lcds_no_data()
 
     def shutdown(self) -> None:

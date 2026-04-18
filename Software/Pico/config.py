@@ -159,6 +159,12 @@ DROK_RELAY_IN1_PIN = 10
 DROK_RELAY_IN2_PIN = 11
 # Max constant-current limit written to DROK I-SET (A); XY6020L supports up to 20 A — set conservatively.
 DROK_I_SET_LIMIT_A = 8.0
+# CC mode (DROK_MODS / drok_coil_driver_app): when True, axis set_x_v / set_y_v / set_z_v value is **coil current mA**
+# (same numeric sense as host spin). Firmware writes I_SET from that mA and V_SET = DROK_CC_V_HEADROOM * (mA/1000) * R
+# so the module can regulate in CC. Match DROK_COIL_R_OHMS to measured DC Ω for this axis (see CalibratorUI.ini [helmholtz] *_r_ohm).
+DROK_CC_MODE = False
+DROK_COIL_R_OHMS = 10.6
+DROK_CC_V_HEADROOM = 1.2
 # Per-unit identity + LCD address on Pico flash (see drok_coil_driver_app.py). Same firmware on X/Y/Z enclosures.
 DROK_AXIS_CONFIG_FILENAME = "axis_config.ini"
 # If axis_config.ini is missing or has no controlled_axis= line, use this LCD line-1 label (16 chars max).

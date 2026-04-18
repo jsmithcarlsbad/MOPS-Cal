@@ -1,7 +1,9 @@
 # drok_coil_driver_app.py — One XY6020L (Modbus) + 2-ch relays + SAFE/Operate per Pico (DROK_MODS.md).
 # Identical firmware on X/Y/Z enclosures; per-unit axis label and LCD I2C address from axis_config.ini on flash.
-# TM:: includes measured_ma / measured_vdc (DROK output). "?" returns controlled axis name + VERSION (no CalibratorUI change required yet).
-# DROK-native lines: set_vdc / set_ma / set_power ON|OFF + get_* (see hw_report).
+# TM:: includes measured_ma / measured_vdc (DROK output), drok_cc_led=0|1|2 for host CC LEDs. "?" returns controlled axis name + VERSION.
+# DROK_CC_MODE (config.py): set_x_v/set_y_v/set_z_v value is **coil current mA**; firmware sets I_SET from mA and
+# V_SET = DROK_CC_V_HEADROOM * (mA/1000) * DROK_COIL_R_OHMS so the module can run in CC. Otherwise set_*_v is volts (CV-style).
+# DROK-native lines: set_vdc / set_ma / set_power ON|OFF + get_* (see hw_report). set_vdc is ERR when DROK_CC_MODE is on.
 # LCD: ESTOP / INFO / lcd_clear / host_operate. Relays: relay_1|relay_2 ON|OFF, set_pol POS|NEG, get_pol (DROK off first), get_relays, get_status.
 import sys
 import time
@@ -10,8 +12,8 @@ from machine import I2C, Pin, UART, Timer
 
 import config
 
-VERSION_MAJOR = 1
-VERSION_MINOR = 4
+VERSION_MAJOR = 6
+VERSION_MINOR = 2
 VERSION = "%d.%d" % (VERSION_MAJOR, VERSION_MINOR)
 
 # XY6020L holding register indices (0-based), 0.01 V / 0.01 A LSB where applicable — see tinkering4fun / Jens3382 xy6020l.h.
@@ -257,13 +259,6 @@ def _axis_letter():
     return "X"
 
 
-def _lcd_line1():
-    s = (_controlled_axis or "? AXIS")[:16]
-    if len(s) < 16:
-        s = (s + " " * 16)[:16]
-    return s
-
-
 # --- runtime ---
 mb = None
 uart_drok = None
@@ -281,6 +276,8 @@ _back_deploy_fired = False
 _back_last_edge_ms = None
 
 set_v = 0.0
+# When config.DROK_CC_MODE: last commanded coil current target (mA) for CC setpoint; set_*_v host lines carry mA.
+_cc_target_ma = 0.0
 _host_enable = False
 _drok_output_on = False
 
@@ -563,16 +560,6 @@ def _init_lcd():
         host_print("STATUS LCD init ERR:", e)
 
 
-def _lcd_center_16(text):
-    s = (text or "")[:16]
-    L = len(s)
-    if L >= 16:
-        return s
-    pad = 16 - L
-    left = pad // 2
-    return (" " * left) + s + (" " * (pad - left))
-
-
 def _lcd_sanitize_ascii(s):
     out = []
     for ch in (s or ""):
@@ -586,29 +573,38 @@ def _lcd_sanitize_ascii(s):
     return "".join(out)
 
 
-def _lcd_pad_16(s):
-    t = _lcd_sanitize_ascii(s)
-    return (t + "                ")[:16]
+def _lcd_center_16(text):
+    s = _lcd_sanitize_ascii(text or "")
+    L = len(s)
+    if L >= 16:
+        return s
+    pad = 16 - L
+    left = pad // 2
+    return (" " * left) + s + (" " * (pad - left))
+
+
+def _lcd_line1():
+    return _lcd_sanitize_ascii(_controlled_axis or "? AXIS")
 
 
 def _split_two_host_lines(rest, default_line1, default_line2):
-    """Parse `line1|line2` (pipe). Rest is text after the command word."""
+    """Parse `line1|line2` (pipe). Rest is text after the command word. Each line is 16 chars, centered."""
     s = (rest or "").strip()
     if not s:
-        return _lcd_pad_16(default_line1), _lcd_pad_16(default_line2)
+        return _lcd_center_16(default_line1), _lcd_center_16(default_line2)
     if s.startswith("|"):
         s = s[1:]
     parts = s.split("|", 1)
     if len(parts) == 2:
-        return _lcd_pad_16(parts[0]), _lcd_pad_16(parts[1])
-    return _lcd_pad_16(s), _lcd_pad_16(default_line2)
+        return _lcd_center_16(parts[0]), _lcd_center_16(parts[1])
+    return _lcd_center_16(s), _lcd_center_16(default_line2)
 
 
 def _lcd_put_row(row, text):
     global _lcd_write_err_logged, _lcd
     if _lcd is None:
         return
-    s = (text + "                ")[:16]
+    s = _lcd_center_16(text)
     try:
         _lcd.move_to(0, row)
         _lcd.putstr(s)
@@ -648,8 +644,8 @@ def lcd_refresh(force=False):
         if _deploy_standalone_lcd:
             if _lcd_prev_layout is not None and _lcd_prev_layout != "d":
                 _lcd_clear()
-            _lcd_put_row(0, _lcd_center_16("READY FOR"))
-            _lcd_put_row(1, _lcd_center_16("DEPLOYMENT"))
+            _lcd_put_row(0, "READY FOR")
+            _lcd_put_row(1, "DEPLOYMENT")
             _lcd_prev_layout = "d"
             return
         if _safe_asserted:
@@ -657,8 +653,8 @@ def lcd_refresh(force=False):
                 _lcd_put_row(0, _lcd_override[1])
                 _lcd_put_row(1, _lcd_override[2])
             else:
-                _lcd_put_row(0, _lcd_center_16("SAFE"))
-                _lcd_put_row(1, _lcd_center_16("OUTPUT OFF"))
+                _lcd_put_row(0, "SAFE")
+                _lcd_put_row(1, "OUTPUT OFF")
             _lcd_prev_layout = "s"
             return
         if _lcd_override and _lcd_override[0] == "info":
@@ -672,7 +668,7 @@ def lcd_refresh(force=False):
         if _lcd_prev_layout is not None and _lcd_prev_layout != layout:
             _lcd_clear()
         _lcd_put_row(0, _lcd_line1())
-        _lcd_put_row(1, _lcd_center_16("Ver.%s" % VERSION))
+        _lcd_put_row(1, "Ver.%s" % VERSION)
         _lcd_prev_layout = layout
     except Exception as e:
         if not _lcd_refresh_err_logged:
@@ -693,7 +689,7 @@ def _show_boot_lcd_splash():
             pass
         _lcd_clear()
         _lcd_put_row(0, _lcd_line1())
-        _lcd_put_row(1, _lcd_center_16("Ver.%s" % VERSION))
+        _lcd_put_row(1, "Ver.%s" % VERSION)
         time.sleep(splash_s)
     except Exception:
         pass
@@ -712,12 +708,13 @@ def _drok_force_output_off():
 
 
 def _apply_safe_hardware(reason):
-    global _host_enable, set_v, _safe_asserted, _lcd_override
+    global _host_enable, set_v, _safe_asserted, _lcd_override, _cc_target_ma
     if _lcd_override and _lcd_override[0] == "info":
         _lcd_override = None
     _safe_asserted = True
     _host_enable = False
     set_v = 0.0
+    _cc_target_ma = 0.0
     _drok_force_output_off()
     _relay_pins_off()
     host_print("STATUS SAFE —", reason)
@@ -783,6 +780,81 @@ def _write_i_set_limit():
     _write_i_set_centi(_i_set_centi_max())
 
 
+def _drok_cc_mode():
+    return bool(getattr(config, "DROK_CC_MODE", False))
+
+
+def _coil_r_ohm():
+    r = float(getattr(config, "DROK_COIL_R_OHMS", 0.0))
+    if r != r or r < 0.0:
+        return 0.0
+    return r
+
+
+def _cc_v_headroom():
+    h = float(getattr(config, "DROK_CC_V_HEADROOM", 1.2))
+    if h != h or h < 1.0:
+        return 1.2
+    return h
+
+
+def _i_centi_from_ma(ma_abs):
+    """XY6020L I_SET LSB 0.01 A; host/set_ma use mA. Returns centi-units for register (>=1 when ma>0)."""
+    ma_abs = float(ma_abs)
+    if ma_abs <= 0.0:
+        return 0
+    return int(max(1, min(round(ma_abs / 10.0), _i_set_centi_max())))
+
+
+def _drok_cc_apply_setpoints_ma(ma):
+    """Write I_SET and V_SET for CC operation. ma = target coil current (mA). Updates global set_v to V ceiling (V)."""
+    global set_v, _cc_target_ma
+    _cc_target_ma = max(0.0, float(ma))
+    if mb is None:
+        return False
+    if _cc_target_ma <= 0.0 or _cc_target_ma != _cc_target_ma:
+        set_v = 0.0
+        if not _write_i_set_centi(1):
+            return False
+        return _write_v_set_centi(0)
+    r = _coil_r_ohm()
+    if r <= 0.0:
+        host_print("TXT:: ERR DROK_CC_MODE needs config.DROK_COIL_R_OHMS > 0")
+        return False
+    i_a = _cc_target_ma / 1000.0
+    v = _cc_v_headroom() * i_a * r
+    vmax = _v_cmd_max()
+    if v > vmax:
+        v = vmax
+    set_v = v
+    centi_v = int(min(6000, max(0, round(v * 100.0))))
+    ci = _i_centi_from_ma(_cc_target_ma)
+    if not _write_i_set_centi(ci):
+        return False
+    return _write_v_set_centi(centi_v)
+
+
+def _drok_cc_sync_output():
+    """After I_SET/V_SET written: turn DROK output on if host enabled and CC target > 0."""
+    global _drok_output_on
+    if mb is None or _is_safe():
+        _drok_force_output_off()
+        return
+    if not _host_enable:
+        _drok_force_output_off()
+        return
+    if _cc_target_ma <= 0.0:
+        _drok_force_output_off()
+        return
+    try:
+        if not mb.write_single(HREG_OUTPUT_ON, 1):
+            _drok_output_on = False
+        else:
+            _drok_output_on = True
+    except Exception:
+        _drok_output_on = False
+
+
 def _write_v_set_centi(centi_v):
     if mb is None:
         return False
@@ -819,10 +891,16 @@ def _apply_voltage_to_drok():
     if not _host_enable:
         _drok_force_output_off()
         return
-    vmax = _v_cmd_max()
-    v = max(0.0, min(vmax, float(set_v)))
-    centi_v = int(min(6000, max(0, round(v * 100.0))))
     try:
+        if _drok_cc_mode():
+            if not _drok_cc_apply_setpoints_ma(_cc_target_ma):
+                _drok_output_on = False
+                return
+            _drok_cc_sync_output()
+            return
+        vmax = _v_cmd_max()
+        v = max(0.0, min(vmax, float(set_v)))
+        centi_v = int(min(6000, max(0, round(v * 100.0))))
         if not _write_v_set_centi(centi_v):
             _drok_output_on = False
             return
@@ -870,10 +948,11 @@ def _measured_ma_vdc():
 
 
 def _apply_deploy_ready(status_tag=None, refresh_lcd=True):
-    global _last_host_rx_ms, _deploy_standalone_lcd, _host_enable, set_v, _lcd_override
+    global _last_host_rx_ms, _deploy_standalone_lcd, _host_enable, set_v, _lcd_override, _cc_target_ma
     _lcd_override = None
     _host_enable = False
     set_v = 0.0
+    _cc_target_ma = 0.0
     _last_host_rx_ms = None
     _deploy_standalone_lcd = True
     _drok_force_output_off()
@@ -1011,6 +1090,29 @@ def _fmt_float(x, fmt="%.3f"):
         return "nan"
 
 
+def _drok_cc_led_tm_value(mb_ok, ma, vdc):
+    """TM token drok_cc_led: 0=red (CC off / output off), 1=lime (regulating in CC), 2=yellow (CC not maintained)."""
+    if not _drok_cc_mode():
+        return 0
+    if not mb_ok or (not _drok_output_on) or _cc_target_ma <= 0.0:
+        return 0
+    if ma != ma or vdc != vdc:
+        return 2
+    vset = float(set_v)
+    i_tgt = float(_cc_target_ma)
+    if vset < 0.03:
+        return 0
+    tol_ma = max(25.0, 0.10 * max(i_tgt, 1.0))
+    v_fold = vset - vdc
+    if v_fold > 0.06 and abs(ma - i_tgt) < tol_ma:
+        return 1
+    if vdc >= vset - 0.06:
+        return 2
+    if abs(ma - i_tgt) >= tol_ma:
+        return 2
+    return 2
+
+
 def _emit_tm_scheduled(_):
     global _last_tm_emit_ms, _host_txt_burst_active
     if _host_txt_burst_active:
@@ -1046,6 +1148,7 @@ def _emit_tm_scheduled(_):
         cvy = vdc if ax == "Y" else float("nan")
         cvz = vdc if ax == "Z" else float("nan")
         safe_tok = 1 if (_is_safe() or _safe_asserted) else 0
+        cc_led = _drok_cc_led_tm_value(mb_ok, ma, vdc)
         parts = [
             "meas_ok=%d" % mb_ok,
             "measured_ma=%s" % _fmt_float(ma, "%.1f"),
@@ -1073,6 +1176,9 @@ def _emit_tm_scheduled(_):
             "diag_Z_duty=0",
             "alarm=0",
             "drok_axis=%s" % ax,
+            "drok_cc_mode=%d" % (1 if _drok_cc_mode() else 0),
+            "drok_cc_ma=%s" % _fmt_float(_cc_target_ma, "%.2f"),
+            "drok_cc_led=%d" % int(cc_led),
             "drok_out=%d" % (1 if _drok_output_on else 0),
             "drok_i_limit_ma=%s" % _fmt_float(ilim_ma, "%.1f"),
             "relay_1=%d" % (1 if _relay_pin_energized(relay1) else 0),
@@ -1146,7 +1252,7 @@ def _cmd_applies_to_us(key):
 
 
 def handle_line(line):
-    global set_v, _last_host_rx_ms, _deploy_standalone_lcd, _host_enable
+    global set_v, _last_host_rx_ms, _deploy_standalone_lcd, _host_enable, _cc_target_ma
     global _lcd_override, _safe_asserted
 
     s = (line or "").strip()
@@ -1247,6 +1353,12 @@ def handle_line(line):
         v = _parse_float(rest, None)
         if v is None:
             return "ERR args"
+        if _drok_cc_mode():
+            ma = max(0.0, float(v))
+            if not _drok_cc_apply_setpoints_ma(ma):
+                return "ERR modbus"
+            _drok_cc_sync_output()
+            return "OK %s %.3f" % (key, set_v)
         set_v = max(0.0, min(_v_cmd_max(), float(v)))
         centi = int(min(6000, max(0, round(set_v * 100.0))))
         if not _write_v_set_centi(centi):
@@ -1267,12 +1379,16 @@ def handle_line(line):
         _host_enable = on
         if not on:
             set_v = 0.0
+            if _drok_cc_mode():
+                _cc_target_ma = 0.0
             _drok_force_output_off()
         else:
             _apply_voltage_to_drok()
         return "OK %s %d" % (key, 1 if on else 0)
 
     if key == "set_vdc":
+        if _drok_cc_mode():
+            return "ERR cc_mode use set_x_v mA (DROK_CC_MODE)"
         if _is_safe() or _safe_asserted:
             return "ERR safe"
         v = _parse_float(rest, None)
@@ -1292,6 +1408,11 @@ def handle_line(line):
         ma = _parse_float(rest, None)
         if ma is None:
             return "ERR args"
+        if _drok_cc_mode():
+            if not _drok_cc_apply_setpoints_ma(float(ma)):
+                return "ERR modbus"
+            _drok_cc_sync_output()
+            return "OK set_ma %.2f" % max(0.0, float(ma))
         centi_a = int(max(1, min(round(float(ma) / 10.0), _i_set_centi_max())))
         if not _write_i_set_centi(centi_a):
             return "ERR modbus"
@@ -1305,6 +1426,9 @@ def handle_line(line):
             return "ERR safe"
         _host_enable = bool(st)
         if not st:
+            set_v = 0.0
+            if _drok_cc_mode():
+                _cc_target_ma = 0.0
             _drok_force_output_off()
         else:
             _apply_voltage_to_drok()
@@ -1505,7 +1629,8 @@ def _report_hardware_to_host(boot_footer=True):
 def _report_hardware_to_host_body(boot_footer=True):
     host_print("OK VERSION %s" % VERSION)
     host_print(
-        "DROK: set_vdc set_ma set_power get_* set_ovp set_ocp get_ovp get_ocp get_protect"
+        "DROK: set_vdc set_ma set_power get_* set_ovp set_ocp get_ovp get_ocp get_protect "
+        "(set_vdc disabled when DROK_CC_MODE)"
     )
     host_print(
         "LCD: ESTOP [line1|line2] INFO line1|line2 lcd_clear host_operate (physical SAFE closed)"
@@ -1517,6 +1642,13 @@ def _report_hardware_to_host_body(boot_footer=True):
     host_print("DROK single-axis — Modbus V/I; TM:: measured_ma measured_vdc; ? -> AXIS + VERSION")
     host_print("  controlled_axis=%r (ini or default)" % _controlled_axis)
     host_print("  axis_letter=%s TM maps mA/V to that axis only" % _axis_letter())
+    if _drok_cc_mode():
+        host_print(
+            "  DROK_CC_MODE on: set_*_v / set_ma arg = coil mA; V_SET=%.3f*(mA/1000)*R Ω; R=%.4f Ω"
+            % (_cc_v_headroom(), _coil_r_ohm())
+        )
+    else:
+        host_print("  DROK_CC_MODE off: set_*_v = output volts (CV); set_ma = I_SET limit (mA)")
     if _lcd_i2c_addr_used is not None:
         host_print("  LCD OK 0x%02x" % int(_lcd_i2c_addr_used))
     else:
